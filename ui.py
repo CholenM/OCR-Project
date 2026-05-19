@@ -6,14 +6,14 @@ import pandas as pd
 # --- APPMANAGER CONFIGURATION ---
 FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
-st.set_page_config(page_title="Legal OCR - Control Center", page_icon="⚖️", layout="wide")
+st.set_page_config(page_title="Legal OCR - Control Center", page_icon="", layout="wide")
 st.title("⚖️ Enterprise Legal OCR & Billing Dashboard")
 st.markdown("---")
 
 # --- SIDEBAR CONTROL UNIT ---
-st.sidebar.header("🔑 Authentication")
+st.sidebar.header("Authentication")
 api_key_input = st.sidebar.text_input("Enter Service API Key", type="password")
-st.sidebar.markdown("### 🛠️ Developer Sandbox Keys")
+st.sidebar.markdown("### Developer Sandbox Keys")
 st.sidebar.code("legal_team_secret_abc123\ntest_key_0000", language="text")
 
 if "ocr_result" not in st.session_state:
@@ -23,7 +23,7 @@ if "ocr_result" not in st.session_state:
 col_dashboard, col_actions = st.columns([1.3, 1], gap="large")
 
 with col_dashboard:
-    st.header("📊 Telemetry & Audit Ledger")
+    st.header("API Tracking Usage")
     
     if api_key_input:
         headers = {"X-API-KEY": api_key_input}
@@ -89,7 +89,7 @@ with col_actions:
     st.header("📄 Batch Pipeline Ingestion")
     
     uploaded_file = st.file_uploader("Upload Legal Asset", type=["pdf", "jpg", "png"])
-    trigger_ocr = st.button("🚀 Execute Hardware Accelerated OCR", use_container_width=True)
+    trigger_ocr = st.button("Execute OCR", use_container_width=True)
     
     if trigger_ocr and api_key_input and uploaded_file:
         with st.spinner("Streaming directly to Local GPU Pipeline..."):
@@ -114,7 +114,7 @@ with col_actions:
 
     if st.session_state.ocr_result:
         st.download_button(
-            label="💾 Download Rendered Markdown (.md)",
+            label="Download Rendered Markdown",
             data=st.session_state.ocr_result,
             file_name=f"legal_export_{int(time.time())}.md",
             mime="text/markdown",

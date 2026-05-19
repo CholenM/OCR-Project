@@ -32,7 +32,7 @@ API_KEY_DB = {
     "test_key_0000": {
         "user": "Internal Benchmark Test",
         "active": True,
-        "monthly_spend_cap": 5.00,
+        "monthly_spend_cap": 1.00,
         "current_month_spend": 0.00,
         "rate_per_page": 0.00,
         "metrics": {
