@@ -11,8 +11,8 @@ import requests
 app = FastAPI(title="Enterprise Legal OCR Gateway API")
 
 # --- LAYER 1 CONFIGURATION (LM STUDIO) ---
-LM_STUDIO_URL = "http://localhost:1234/v1/chat/completions"
-
+LM_STUDIO_URL = "http://192.168.1.91:8080/v1/chat/completions"
+LM_STUDIO_API_KEY = "sk-ocr-layer1"
 # --- BUSINESS LOGIC: ENTERPRISE DATABASE SCHEMA ---
 API_KEY_DB = {
     "legal_team_secret_abc123": {
@@ -69,7 +69,7 @@ async def verify_api_key(x_api_key: str = Header(..., description="Custom API Ke
 # --- CORE INFERENCE CALL WITH TELEMETRY ---
 def query_lm_studio_ocr(base64_image: str):
     payload = {
-        "model": "qwen3-vl-2b-instruct",
+        "model": "qwen3vl-2b-instruct",
         "messages": [
             {
                 "role": "system",
@@ -83,29 +83,34 @@ def query_lm_studio_ocr(base64_image: str):
                 "role": "user",
                 "content": [
                     {"type": "text", "text": "Extract all text and structure into Markdown."},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}}
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{base64_image}"
+                    }}
                 ]
             }
         ],
         "temperature": 0.0
     }
-    
+
     try:
-        response = requests.post(LM_STUDIO_URL, json=payload, timeout=120)
+        response = requests.post(
+            LM_STUDIO_URL,
+            json=payload,
+            headers={"Authorization": f"Bearer {LM_STUDIO_API_KEY}"},
+            timeout=120
+        )
         if response.status_code == 200:
             result = response.json()
             text = result["choices"][0]["message"]["content"]
-            
             usage = result.get("usage", {})
             prompt_toks = usage.get("prompt_tokens", 0)
             comp_toks = usage.get("completion_tokens", 0)
-            
             return text, prompt_toks, comp_toks
         else:
             return f"\nError (Status {response.status_code}): {response.text}\n", 0, 0
     except Exception as e:
         return f"\nLocal Engine Failed: {str(e)}\n", 0, 0
-
+    
 # --- OCR PIPELINE ENDPOINT ---
 @app.post("/v1/ocr", response_class=Response)
 async def process_document(
