@@ -11,7 +11,7 @@ import requests
 app = FastAPI(title="Enterprise Legal OCR Gateway API")
 
 # --- LAYER 1 CONFIGURATION (LM STUDIO) ---
-LM_STUDIO_URL = "http://192.168.1.91:8080/v1/chat/completions"
+LM_STUDIO_URL = "http://192.168.1.91:0001/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
 # --- BUSINESS LOGIC: ENTERPRISE DATABASE SCHEMA ---
 API_KEY_DB = {
