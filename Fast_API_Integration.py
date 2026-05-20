@@ -67,7 +67,7 @@ async def verify_api_key(x_api_key: str = Header(..., description="Custom API Ke
     return x_api_key
 
 # --- CORE INFERENCE CALL WITH TELEMETRY ---
-def query_lm_studio_ocr(base64_image: str):
+def query_lm_studio_ocr(base64_image: str, mime_type: str = "image/png"):
     payload = {
         "model": "qwen3vl-2b-instruct",
         "messages": [
@@ -89,7 +89,7 @@ def query_lm_studio_ocr(base64_image: str):
                 "content": [
                     {"type": "text", "text": "Extract all text and structure into Markdown."},
                     {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
+                        "url": f"data:{mime_type};base64,{base64_image}"
                     }}
                 ]
             }
@@ -138,11 +138,11 @@ async def process_document(
                 session_pages += 1
                 generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
                 
-                pix = page.get_pixmap(dpi=200)
-                jpeg_bytes = pix.tobytes("jpeg")
-                base64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
-                
-                text, p_tok, c_tok = query_lm_studio_ocr(base64_str)
+                pix = page.get_pixmap(dpi=300)
+                png_bytes = pix.tobytes("png")
+                base64_str = base64.b64encode(png_bytes).decode("utf-8")
+
+                text, p_tok, c_tok = query_lm_studio_ocr(base64_str, mime_type="image/png")
                 generated_markdown += text + "\n"
                 session_in_tokens += p_tok
                 session_out_tokens += c_tok
@@ -152,7 +152,8 @@ async def process_document(
         elif content_type in ["image/jpeg", "image/jpg", "image/png"]:
             session_pages += 1
             base64_str = base64.b64encode(file_bytes).decode("utf-8")
-            text, p_tok, c_tok = query_lm_studio_ocr(base64_str)
+            mime_type = content_type or "image/png"
+            text, p_tok, c_tok = query_lm_studio_ocr(base64_str, mime_type=mime_type)
             generated_markdown += text
             session_in_tokens += p_tok
             session_out_tokens += c_tok
