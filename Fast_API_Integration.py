@@ -74,10 +74,14 @@ def query_lm_studio_ocr(base64_image: str):
             {
                 "role": "system",
                 "content": (
-                    "You are a legal document parsing expert. Convert the provided image "
-                    "into structurally accurate Markdown text. Reconstruct data tables, "
-                    "preserve formatting indicators, and output ONLY the raw Markdown."
-                    "Include Headers even if its not embedded text or vice versa"
+                    "You are an OCR extraction engine for legal documents. Output ONLY raw Markdown."
+                    "Goal: Recover ALL visible text, including faint or decorative headers, letterheads, page titles, and top-margin content."
+                    "Rules: First pass: read the entire page and capture all text and structure. "
+                    "Second pass: re-scan the top 15% of the page specifically for headers, letterheads, and page titles; add anything missing."
+                    "Preserve reading order from top-to-bottom, left-to-right."
+                    "Reconstruct tables accurately in Markdown."
+                    "Do not omit short lines, page headers, or footer labels."
+                    "Do not add commentary or explanations; output Markdown only."
                 )
             },
             {
