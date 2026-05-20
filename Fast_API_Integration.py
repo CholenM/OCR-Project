@@ -11,7 +11,7 @@ import requests
 app = FastAPI(title="Enterprise Legal OCR Gateway API")
 
 # --- LAYER 1 CONFIGURATION (LM STUDIO) ---
-LM_STUDIO_URL = "http://192.168.1.91:8080/v1/chat/completions"
+LM_STUDIO_URL = "http://192.168.1.91:8000/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
 # --- BUSINESS LOGIC: ENTERPRISE DATABASE SCHEMA ---
 API_KEY_DB = {
@@ -67,16 +67,21 @@ async def verify_api_key(x_api_key: str = Header(..., description="Custom API Ke
     return x_api_key
 
 # --- CORE INFERENCE CALL WITH TELEMETRY ---
-def query_lm_studio_ocr(base64_image: str):
+def query_lm_studio_ocr(base64_image: str, mime_type: str = "image/png"):
     payload = {
-        "model": "qwen3vl-2b-instruct",
+        "model": "PaddleOCR-VL-1.5",
         "messages": [
             {
                 "role": "system",
                 "content": (
-                    "You are a legal document parsing expert. Convert the provided image "
-                    "into structurally accurate Markdown text. Reconstruct data tables, "
-                    "preserve formatting indicators, and output ONLY the raw Markdown."
+                    "You are an OCR extraction engine for legal documents. Output ONLY raw Markdown."
+                    "Goal: Recover ALL visible text, including faint or decorative headers, letterheads, page titles, and top-margin content."
+                    "Rules: First pass: read the entire page and capture all text and structure. "
+                    "Second pass: re-scan the top 15% of the page specifically for headers, letterheads, and page titles; add anything missing."
+                    "Preserve reading order from top-to-bottom, left-to-right."
+                    "Reconstruct tables accurately in Markdown."
+                    "Do not omit short lines, page headers, or footer labels."
+                    "Do not add commentary or explanations; output Markdown only."
                 )
             },
             {
@@ -84,7 +89,7 @@ def query_lm_studio_ocr(base64_image: str):
                 "content": [
                     {"type": "text", "text": "Extract all text and structure into Markdown."},
                     {"type": "image_url", "image_url": {
-                        "url": f"data:image/jpeg;base64,{base64_image}"
+                        "url": f"data:{mime_type};base64,{base64_image}"
                     }}
                 ]
             }
@@ -133,11 +138,11 @@ async def process_document(
                 session_pages += 1
                 generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
                 
-                pix = page.get_pixmap(dpi=200)
-                jpeg_bytes = pix.tobytes("jpeg")
-                base64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
-                
-                text, p_tok, c_tok = query_lm_studio_ocr(base64_str)
+                pix = page.get_pixmap(dpi=300)
+                png_bytes = pix.tobytes("png")
+                base64_str = base64.b64encode(png_bytes).decode("utf-8")
+
+                text, p_tok, c_tok = query_lm_studio_ocr(base64_str, mime_type="image/png")
                 generated_markdown += text + "\n"
                 session_in_tokens += p_tok
                 session_out_tokens += c_tok
@@ -147,7 +152,8 @@ async def process_document(
         elif content_type in ["image/jpeg", "image/jpg", "image/png"]:
             session_pages += 1
             base64_str = base64.b64encode(file_bytes).decode("utf-8")
-            text, p_tok, c_tok = query_lm_studio_ocr(base64_str)
+            mime_type = content_type or "image/png"
+            text, p_tok, c_tok = query_lm_studio_ocr(base64_str, mime_type=mime_type)
             generated_markdown += text
             session_in_tokens += p_tok
             session_out_tokens += c_tok
