@@ -77,6 +77,7 @@ def query_lm_studio_ocr(base64_image: str):
                     "You are a legal document parsing expert. Convert the provided image "
                     "into structurally accurate Markdown text. Reconstruct data tables, "
                     "preserve formatting indicators, and output ONLY the raw Markdown."
+                    "Include Headers even if its not embedded text or vice versa"
                 )
             },
             {
