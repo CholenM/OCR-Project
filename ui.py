@@ -87,6 +87,11 @@ with col_dashboard:
 
 with col_actions:
     st.header("📄 Batch Pipeline Ingestion")
+
+    dpi_value = st.slider("Render DPI", min_value=120, max_value=350, value=200, step=10)
+    mode_label = st.selectbox("Processing Mode", ["Serial", "Concurrent"], index=1)
+    max_concurrency = st.number_input("Max Concurrency", min_value=1, max_value=8, value=3, step=1)
+    st.caption("Serial uses lower memory. Concurrent improves throughput when hardware allows it.")
     
     uploaded_file = st.file_uploader("Upload Legal Asset", type=["pdf", "jpg", "png"])
     trigger_ocr = st.button("Execute OCR", use_container_width=True)
@@ -96,8 +101,20 @@ with col_actions:
             headers = {"X-API-KEY": api_key_input}
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
             
+            mode_value = mode_label.lower()
+            params = {
+                "dpi": dpi_value,
+                "mode": mode_value,
+                "max_concurrency": int(max_concurrency)
+            }
+
             try:
-                ocr_resp = requests.post(f"{FASTAPI_BASE_URL}/v1/ocr", headers=headers, files=files)
+                ocr_resp = requests.post(
+                    f"{FASTAPI_BASE_URL}/v1/ocr",
+                    headers=headers,
+                    files=files,
+                    params=params
+                )
                 
                 if ocr_resp.status_code == 200:
                     st.session_state.ocr_result = ocr_resp.text

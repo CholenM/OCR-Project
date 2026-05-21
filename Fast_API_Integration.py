@@ -127,7 +127,10 @@ async def query_lm_studio_ocr_async(
 @app.post("/v1/ocr", response_class=Response)
 async def process_document(
     file: UploadFile = File(...),
-    api_key: str = Depends(verify_api_key)
+    api_key: str = Depends(verify_api_key),
+    dpi: int = 200,
+    mode: str = "concurrent",
+    max_concurrency: int = MAX_PAGE_CONCURRENCY
 ):
     start_time = time.time()
     file_bytes = await file.read()
@@ -139,34 +142,48 @@ async def process_document(
     session_out_tokens = 0
     
     try:
+        dpi = max(72, min(dpi, 400))
+        max_concurrency = max(1, min(max_concurrency, MAX_PAGE_CONCURRENCY))
+        mode = mode.lower().strip()
+        if mode not in ["serial", "concurrent"]:
+            raise HTTPException(status_code=400, detail="Invalid mode. Use 'serial' or 'concurrent'.")
+
         if content_type == "application/pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             page_payloads = []
 
             for index, page in enumerate(doc):
                 session_pages += 1
-                pix = page.get_pixmap(dpi=200)
+                pix = page.get_pixmap(dpi=dpi)
                 jpeg_bytes = pix.tobytes("jpeg")
                 base64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
                 page_payloads.append((index, base64_str))
 
             doc.close()
 
-            semaphore = asyncio.Semaphore(MAX_PAGE_CONCURRENCY)
-            tasks = [
-                query_lm_studio_ocr_async(payload, "image/jpeg", semaphore)
-                for _, payload in page_payloads
-            ]
-            results = await asyncio.gather(*tasks)
+            if mode == "serial":
+                for index, payload in page_payloads:
+                    text, p_tok, c_tok = query_lm_studio_ocr(payload, mime_type="image/jpeg")
+                    generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
+                    generated_markdown += text + "\n"
+                    session_in_tokens += p_tok
+                    session_out_tokens += c_tok
+            else:
+                semaphore = asyncio.Semaphore(max_concurrency)
+                tasks = [
+                    query_lm_studio_ocr_async(payload, "image/jpeg", semaphore)
+                    for _, payload in page_payloads
+                ]
+                results = await asyncio.gather(*tasks)
 
-            for (index, _), (text, p_tok, c_tok) in sorted(
-                zip(page_payloads, results),
-                key=lambda item: item[0][0]
-            ):
-                generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
-                generated_markdown += text + "\n"
-                session_in_tokens += p_tok
-                session_out_tokens += c_tok
+                for (index, _), (text, p_tok, c_tok) in sorted(
+                    zip(page_payloads, results),
+                    key=lambda item: item[0][0]
+                ):
+                    generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
+                    generated_markdown += text + "\n"
+                    session_in_tokens += p_tok
+                    session_out_tokens += c_tok
                 
         elif content_type in ["image/jpeg", "image/jpg", "image/png"]:
             session_pages += 1
