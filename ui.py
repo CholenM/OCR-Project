@@ -88,12 +88,25 @@ with col_dashboard:
 with col_actions:
     st.header("📄 Batch Pipeline Ingestion")
 
-    dpi_value = st.slider("Render DPI", min_value=120, max_value=350, value=200, step=10)
-    mode_label = st.selectbox("Processing Mode", ["Serial", "Concurrent"], index=1)
-    max_concurrency = st.number_input("Max Concurrency", min_value=1, max_value=8, value=3, step=1)
-    st.caption("Serial uses lower memory. Concurrent improves throughput when hardware allows it.")
-    
     uploaded_file = st.file_uploader("Upload Legal Asset", type=["pdf", "jpg", "png"])
+    is_pdf = uploaded_file is not None and uploaded_file.type == "application/pdf"
+
+    if is_pdf:
+        dpi_value = st.slider("Render DPI", min_value=120, max_value=350, value=200, step=10)
+        mode_label = st.selectbox("Processing Mode", ["Serial", "Concurrent"], index=1)
+        mode_value = mode_label.lower()
+
+        if mode_value == "concurrent":
+            max_concurrency = st.number_input("Max Concurrency", min_value=1, max_value=8, value=3, step=1)
+            st.caption("Concurrent improves throughput when hardware allows it.")
+        else:
+            max_concurrency = None
+            st.caption("Serial uses lower memory and is more stable.")
+    else:
+        dpi_value = None
+        mode_value = None
+        max_concurrency = None
+
     trigger_ocr = st.button("Execute OCR", use_container_width=True)
     
     if trigger_ocr and api_key_input and uploaded_file:
@@ -101,12 +114,12 @@ with col_actions:
             headers = {"X-API-KEY": api_key_input}
             files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
             
-            mode_value = mode_label.lower()
-            params = {
-                "dpi": dpi_value,
-                "mode": mode_value,
-                "max_concurrency": int(max_concurrency)
-            }
+            params = {}
+            if is_pdf:
+                params["dpi"] = dpi_value
+                params["mode"] = mode_value
+                if mode_value == "concurrent" and max_concurrency is not None:
+                    params["max_concurrency"] = int(max_concurrency)
 
             try:
                 ocr_resp = requests.post(
