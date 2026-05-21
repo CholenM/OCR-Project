@@ -3,7 +3,6 @@ import base64
 import time
 import asyncio
 from datetime import datetime
-from io import BytesIO
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Header
 from fastapi.responses import Response
 import fitz  # PyMuPDF
@@ -15,7 +14,6 @@ app = FastAPI(title="Enterprise Legal OCR Gateway API")
 LM_STUDIO_URL = "http://192.168.1.91:8000/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
 MAX_PAGE_CONCURRENCY = 3
-JPEG_QUALITY = 95
 # --- BUSINESS LOGIC: ENTERPRISE DATABASE SCHEMA ---
 API_KEY_DB = {
     "legal_team_secret_abc123": {
@@ -148,7 +146,7 @@ async def process_document(
             for index, page in enumerate(doc):
                 session_pages += 1
                 pix = page.get_pixmap(dpi=200)
-                jpeg_bytes = pix.tobytes("jpeg", quality=JPEG_QUALITY)
+                jpeg_bytes = pix.tobytes("jpeg")
                 base64_str = base64.b64encode(jpeg_bytes).decode("utf-8")
                 page_payloads.append((index, base64_str))
 
