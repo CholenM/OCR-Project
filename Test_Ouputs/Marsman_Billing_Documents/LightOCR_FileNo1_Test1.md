@@ -1,0 +1,132 @@
+
+<!-- SECTION: PAGE 1 -->
+# WAN HAI
+
+## BILL OF LADING
+
+**B/L No.** 182DA02197
+
+---
+
+**Shipper:**
+
+MD RIO VISTA AGRI-VENTURES, INC.  
+MACO, COMPOSTELA VALLEY PROVINCE,  
+PHILIPPINES  
+SEC REGISTRATION NO.: +A199908527
+
+---
+
+**Consignee:**
+
+JOY FARMIND SUPPLY CHAIN MANAGEMENT LIMITED  
+ROOM 606, NO. 39-1, CHUANGXIN  
+2ND ROAD SHENYANG AREA, CHINA  
+(LIAONING) PILOT FREE TRADE ZONE  
+USCI: 91210100MA10HMNU31*
+
+---
+
+**Notify party (carrier not to be responsible for failure to notify)**
+
+JOY FARMIND SUPPLY CHAIN MANAGEMENT LIMITED  
+ROOM 606, NO. 39-1, CHUANGXIN  
+2ND ROAD SHENYANG AREA, CHINA  
+(LIAONING) PILOT FREE TRADE ZONE  
+USCI: 91210100MA10HMNU31*
+
+---
+
+**Ocean vessel / Vap No.**
+
+BELAWAN N175
+
+---
+
+**Port of loading**
+
+DAVAO, PHILIPPINES
+
+**Place of receipt**
+
+DAVAO, PHILIPPINES
+
+**Pre-carriage by**
+
+---
+
+**Port of discharge**
+
+SHEKOU, CHINA
+
+**Place of delivery**
+
+SHEKOU, CHINA
+
+---
+
+<table>
+  <tr>
+    <th>Marks & Nos ; Container No / Seal No.</th>
+    <th>New/packages or containers</th>
+    <th>Kind of Packages, Description of goods</th>
+    <th>Cost per/ Measurement</th>
+  </tr>
+  <tr>
+    <td>2 X 40 RF<br>FCL/FCL<br>OTPU6201852 40RF96 WHLP670865<br>OTPU6247684 40RF96 WHLP670854</td>
+    <td>2 CTRS<br>(3,080 CARTONS)</td>
+    <td>"SHIPPER'S PACK LOAD COUNT & SEAL"<br>"SAID TO CONTAIN"<br>FRESH CAVENDISH BANANAS<br>3,080 CARTONS<br>JOYVIO<br>NET WEIGHT -41,580.0 KGS<br><br>CARGO IS STOWED IN A REFRIGERATED CONTAINER AT THE S HIPPER'S REQUESTED CARRYING TEMPERATURE OF 13.3 CELSIUS/ VENTILATION SETTING IS 30 CMH<br>"FREIGHT COLLECT"<br>SAY : TWO CONTAINERS ONLY</td>
+    <td>44,968.000 KGS<br>100.000 CBM</td>
+  </tr>
+</table>
+
+---
+
+**Freight payable at DESTINATION**
+
+**Rs. Rate** 57.1
+
+**No. of original Jil-ck.** ZERO (0)
+
+**Place and date of issue** DAVAO OCT 26 2023
+
+---
+
+**ALL AS ARRANGED**
+
+---
+
+**Laden on board**
+
+**Date** OCT 26 2023  
+BELAWAN N175  
+DAVAO, PHILIPPINES
+
+---
+
+WAN HAI LINES (PHILS), INC.  
+AS AGENT FOR THE CARRIER WAN HAI LINES (SINGAPORE) PTE LTD.
+
+---
+
+**Telex Release**
+
+SHENZHEN UNIWIN INTERNATIONAL LOGISTICS LTD.  
+25/F TIANMIAN CITY BLD, MID, SHENNAN ROAD. SHENZHEN, CHINA  
+TEL : 82816280 FAX : 82816250
+
+---
+
+**SHIPPING AGENT REFERENCES (COMPLETE NAME AND ADDRESS)**
+
+---
+
+**WAN HAI LINES (PHILS), INC.**  
+AS AGENTS FOR THE CARRIER  
+WAN HAI LINES LTD.
+
+---
+
+**[QR Code]**
+
+---
