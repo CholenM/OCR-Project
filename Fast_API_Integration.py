@@ -21,7 +21,7 @@ API_KEY_DB = {
         "active": True,
         "monthly_spend_cap": 50.00,
         "current_month_spend": 0.00,
-        "rate_per_page": 0.05,
+        "rate_per_page": 1.00,
         "metrics": {
             "total_documents": 0,
             "total_pages_processed": 0,
