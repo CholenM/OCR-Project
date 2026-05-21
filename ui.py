@@ -6,8 +6,8 @@ import pandas as pd
 # --- APPMANAGER CONFIGURATION ---
 FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
-st.set_page_config(page_title="Legal OCR - Control Center", page_icon="", layout="wide")
-st.title("⚖️ Enterprise Legal OCR & Billing Dashboard")
+st.set_page_config(page_title="OCR Control Center", page_icon="", layout="wide")
+st.title("OCR Billing Dashboard")
 st.markdown("---")
 
 # --- SIDEBAR CONTROL UNIT ---
@@ -37,7 +37,7 @@ with col_dashboard:
                 st.subheader(f"Identity: {data['user']}")
                 
                 # Financial Guardrails UI
-                st.markdown("##### 💳 Monthly Billing Quota")
+                st.markdown("##### API Usage")
                 spend = data["current_month_spend"]
                 cap = data["monthly_spend_cap"]
                 progress = min(spend / cap, 1.0) if cap > 0 else 0
@@ -53,7 +53,7 @@ with col_dashboard:
                 col3.metric("Tokens Computed", f"{total_tokens:,}")
                 
                 # Transaction Ledger Matrix (With Speed TPS Mapping)
-                st.markdown("### 📜 Transaction Ledger")
+                st.markdown("### Activity Tracker")
                 if data["audit_logs"]:
                     df = pd.DataFrame(data["audit_logs"])
                     
@@ -86,7 +86,7 @@ with col_dashboard:
         st.info("Input API Key in the sidebar to load telemetry.")
 
 with col_actions:
-    st.header("📄 Batch Pipeline Ingestion")
+    st.header("Batch Pipeline Ingestion")
 
     uploaded_file = st.file_uploader("Upload Legal Asset", type=["pdf", "jpg", "png"])
     is_pdf = uploaded_file is not None and uploaded_file.type == "application/pdf"
