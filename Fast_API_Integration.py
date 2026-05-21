@@ -1,6 +1,7 @@
 import os
 import base64
 import time
+import asyncio
 from datetime import datetime
 from io import BytesIO
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Header
@@ -13,6 +14,7 @@ app = FastAPI(title="Enterprise Legal OCR Gateway API")
 # --- LAYER 1 CONFIGURATION (LM STUDIO) ---
 LM_STUDIO_URL = "http://192.168.1.91:8000/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
+MAX_PAGE_CONCURRENCY = 3
 # --- BUSINESS LOGIC: ENTERPRISE DATABASE SCHEMA ---
 API_KEY_DB = {
     "legal_team_secret_abc123": {
@@ -113,6 +115,14 @@ def query_lm_studio_ocr(base64_image: str, mime_type: str = "image/png"):
             return f"\nError (Status {response.status_code}): {response.text}\n", 0, 0
     except Exception as e:
         return f"\nLocal Engine Failed: {str(e)}\n", 0, 0
+
+async def query_lm_studio_ocr_async(
+    base64_image: str,
+    mime_type: str,
+    semaphore: asyncio.Semaphore
+):
+    async with semaphore:
+        return await asyncio.to_thread(query_lm_studio_ocr, base64_image, mime_type)
     
 # --- OCR PIPELINE ENDPOINT ---
 @app.post("/v1/ocr", response_class=Response)
@@ -132,20 +142,32 @@ async def process_document(
     try:
         if content_type == "application/pdf":
             doc = fitz.open(stream=file_bytes, filetype="pdf")
+            page_payloads = []
+
             for index, page in enumerate(doc):
                 session_pages += 1
-                generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
-                
                 pix = page.get_pixmap(dpi=300)
                 png_bytes = pix.tobytes("png")
                 base64_str = base64.b64encode(png_bytes).decode("utf-8")
+                page_payloads.append((index, base64_str))
 
-                text, p_tok, c_tok = query_lm_studio_ocr(base64_str, mime_type="image/png")
+            doc.close()
+
+            semaphore = asyncio.Semaphore(MAX_PAGE_CONCURRENCY)
+            tasks = [
+                query_lm_studio_ocr_async(payload, "image/png", semaphore)
+                for _, payload in page_payloads
+            ]
+            results = await asyncio.gather(*tasks)
+
+            for (index, _), (text, p_tok, c_tok) in sorted(
+                zip(page_payloads, results),
+                key=lambda item: item[0][0]
+            ):
+                generated_markdown += f"\n<!-- SECTION: PAGE {index + 1} -->\n"
                 generated_markdown += text + "\n"
                 session_in_tokens += p_tok
                 session_out_tokens += c_tok
-                
-            doc.close()
                 
         elif content_type in ["image/jpeg", "image/jpg", "image/png"]:
             session_pages += 1
