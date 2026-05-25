@@ -7,7 +7,7 @@ import pandas as pd
 FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
 st.set_page_config(page_title="OCR Control Center", page_icon="", layout="wide")
-st.title("OCR Billing Dashboard")
+st.title("OCR Dashboard")
 st.markdown("---")
 
 # --- SIDEBAR CONTROL UNIT ---
