@@ -2,6 +2,9 @@ Lio Resort Ventures Inc.
 Villa Libertad, El Nido, Palawan  
 VAT Reg. TIN 009-154-565-006
 
+HUNI
+Lio. El Nido
+
 +63 2 902 5963  
 reservations@hunilio.com  
 www.huniresorts.com
