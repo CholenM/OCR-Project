@@ -165,49 +165,35 @@ with preview_left:
 with preview_right:
     st.subheader("Rendered Markdown")
     if st.session_state.ocr_result:
-        rendered_lower = st.session_state.ocr_result.lower()
-        if "<table" in rendered_lower or "<tr" in rendered_lower or "<td" in rendered_lower:
-            html_payload = f"""
-                        <style>
-                            .ocr-render {{
-                                font-family: "Segoe UI", Arial, sans-serif;
-                                color: #e5e7eb;
-                                background: #0f1115;
-                                padding: 16px;
-                                line-height: 1.5;
-                                font-size: 0.95rem;
-                            }}
-                            .ocr-render table {{
-                                width: 100%;
-                                border-collapse: collapse;
-                                margin: 12px 0 16px 0;
-                                font-size: 0.9rem;
-                            }}
-                            .ocr-render th, .ocr-render td {{
-                                border: 1px solid #2a2f3a;
-                                padding: 6px 8px;
-                                vertical-align: top;
-                                text-align: left;
-                            }}
-                            .ocr-render th {{
-                                background: #151925;
-                                font-weight: 600;
-                            }}
-                            .ocr-render hr {{
-                                border: 0;
-                                border-top: 1px solid #2a2f3a;
-                                margin: 12px 0;
-                            }}
-                            .ocr-render p {{
-                                margin: 8px 0;
-                            }}
-                        </style>
-                        <div class="ocr-render">
-              {st.session_state.ocr_result}
-            </div>
-            """
-            st.components.v1.html(html_payload, height=520, scrolling=True)
-        else:
-            st.markdown(st.session_state.ocr_result, unsafe_allow_html=True)
+                rendered_css = """
+                <style>
+                    .streamlit-expanderContent, .stMarkdown {
+                        color: #e5e7eb;
+                    }
+                    .stMarkdown table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin: 12px 0 16px 0;
+                        font-size: 0.9rem;
+                    }
+                    .stMarkdown th, .stMarkdown td {
+                        border: 1px solid #2a2f3a;
+                        padding: 6px 8px;
+                        vertical-align: top;
+                        text-align: left;
+                    }
+                    .stMarkdown th {
+                        background: #151925;
+                        font-weight: 600;
+                    }
+                    .stMarkdown hr {
+                        border: 0;
+                        border-top: 1px solid #2a2f3a;
+                        margin: 12px 0;
+                    }
+                </style>
+                """
+                st.markdown(rendered_css, unsafe_allow_html=True)
+                st.markdown(st.session_state.ocr_result, unsafe_allow_html=True)
     else:
         st.info("Run OCR to see the rendered Markdown.")
