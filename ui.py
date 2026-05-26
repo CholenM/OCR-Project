@@ -90,6 +90,61 @@ with col_dashboard:
     else:
         st.info("Input API Key in the sidebar to load telemetry.")
 
+        st.markdown("### Document Preview")
+        preview_left, preview_right = st.columns(2, gap="large")
+
+        with preview_left:
+                st.subheader("Original PDF")
+                if st.session_state.last_pdf_bytes:
+                        pdf_base64 = base64.b64encode(st.session_state.last_pdf_bytes).decode("utf-8")
+                        pdf_html = f"""
+                        <div style='border:1px solid #ddd; height:600px; overflow:auto;'>
+                            <div id='pdf-viewer'></div>
+                        </div>
+                        <script src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'></script>
+                        <script>
+                            const pdfData = "{pdf_base64}";
+                            const pdfjsLib = window['pdfjs-dist/build/pdf'];
+                            pdfjsLib.GlobalWorkerOptions.workerSrc =
+                                'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+
+                            const container = document.getElementById('pdf-viewer');
+                            const loadingTask = pdfjsLib.getDocument({ data: atob(pdfData) });
+
+                            loadingTask.promise.then(async function(pdf) {{
+                                for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {{
+                                    const page = await pdf.getPage(pageNum);
+                                    const viewport = page.getViewport({ scale: 1.25 });
+
+                                    const canvas = document.createElement('canvas');
+                                    const context = canvas.getContext('2d');
+                                    canvas.height = viewport.height;
+                                    canvas.width = viewport.width;
+                                    canvas.style.display = 'block';
+                                    canvas.style.margin = '0 auto 12px auto';
+
+                                    container.appendChild(canvas);
+
+                                    const renderContext = {{
+                                        canvasContext: context,
+                                        viewport: viewport
+                                    }};
+                                    await page.render(renderContext).promise;
+                                }}
+                            }});
+                        </script>
+                        """
+                        st.components.v1.html(pdf_html, height=620, scrolling=True)
+                else:
+                        st.info("Upload a PDF to enable side-by-side preview.")
+
+        with preview_right:
+                st.subheader("Rendered Markdown")
+                if st.session_state.ocr_result:
+                        st.markdown(st.session_state.ocr_result)
+                else:
+                        st.info("Run OCR to see the rendered Markdown.")
+
 with col_actions:
     st.header("Batch Pipeline Ingestion")
 
@@ -160,9 +215,6 @@ with col_actions:
             mime="text/markdown",
             use_container_width=True
         )
-        
-        with st.expander("Preview Extracted Data", expanded=True):
-            st.markdown(st.session_state.ocr_result)
 
     # --- DOCUMENT PREVIEW ---
     st.markdown("### Document Preview")
