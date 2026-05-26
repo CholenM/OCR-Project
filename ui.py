@@ -165,6 +165,14 @@ with preview_left:
 with preview_right:
     st.subheader("Rendered Markdown")
     if st.session_state.ocr_result:
-        st.markdown(st.session_state.ocr_result)
+        if "<table" in st.session_state.ocr_result.lower():
+            html_payload = f"""
+            <div style="font-family: inherit; color: inherit;">
+              {st.session_state.ocr_result}
+            </div>
+            """
+            st.components.v1.html(html_payload, height=520, scrolling=True)
+        else:
+            st.markdown(st.session_state.ocr_result, unsafe_allow_html=True)
     else:
         st.info("Run OCR to see the rendered Markdown.")
