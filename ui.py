@@ -86,7 +86,7 @@ with col_dashboard:
         st.info("Input API Key in the sidebar to load telemetry.")
 
     st.markdown("### Document Preview")
-    preview_left, preview_right = st.columns(2, gap="large")
+    preview_left, preview_right = st.columns([1, 1], gap="large")
 
     with preview_left:
         st.subheader("Raw Markdown")
