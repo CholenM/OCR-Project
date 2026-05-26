@@ -165,8 +165,8 @@ with preview_left:
 with preview_right:
     st.subheader("Rendered Markdown")
     if st.session_state.ocr_result:
-                rendered_lower = st.session_state.ocr_result.lower()
-                if "<table" in rendered_lower or "<tr" in rendered_lower or "<td" in rendered_lower:
+        rendered_lower = st.session_state.ocr_result.lower()
+        if "<table" in rendered_lower or "<tr" in rendered_lower or "<td" in rendered_lower:
             html_payload = f"""
                         <style>
                             .ocr-render {{
