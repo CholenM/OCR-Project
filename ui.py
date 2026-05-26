@@ -85,22 +85,6 @@ with col_dashboard:
     else:
         st.info("Input API Key in the sidebar to load telemetry.")
 
-    st.markdown("### Document Preview")
-    preview_left, preview_right = st.columns([1, 1], gap="large")
-
-    with preview_left:
-        st.subheader("Raw Markdown")
-        if st.session_state.ocr_result:
-            st.text_area("", value=st.session_state.ocr_result, height=400)
-        else:
-            st.info("Run OCR to see the raw Markdown output.")
-
-    with preview_right:
-        st.subheader("Rendered Markdown")
-        if st.session_state.ocr_result:
-            st.markdown(st.session_state.ocr_result)
-        else:
-            st.info("Run OCR to see the rendered Markdown.")
 
 with col_actions:
     st.header("Batch Pipeline Ingestion")
@@ -167,3 +151,20 @@ with col_actions:
             mime="text/markdown",
             use_container_width=True
         )
+
+st.markdown("### Document Preview")
+preview_left, preview_right = st.columns([1, 1], gap="large")
+
+with preview_left:
+    st.subheader("Raw Markdown")
+    if st.session_state.ocr_result:
+        st.text_area("", value=st.session_state.ocr_result, height=520)
+    else:
+        st.info("Run OCR to see the raw Markdown output.")
+
+with preview_right:
+    st.subheader("Rendered Markdown")
+    if st.session_state.ocr_result:
+        st.markdown(st.session_state.ocr_result)
+    else:
+        st.info("Run OCR to see the rendered Markdown.")
