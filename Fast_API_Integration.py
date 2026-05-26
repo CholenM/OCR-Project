@@ -11,7 +11,7 @@ import requests
 app = FastAPI(title="Enterprise Legal OCR Gateway API")
 
 # LAYER 1 (LLAMA CPP)
-LM_STUDIO_URL = "http://192.168.1.91:8080/v1/chat/completions"
+LM_STUDIO_URL = "http://192.168.1.91:8000/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
 MAX_PAGE_CONCURRENCY = 3
 
@@ -142,7 +142,7 @@ def _normalize_markdown_tables(markdown_text: str) -> str:
 
             parts = [p.strip() for p in stripped.strip("|").split("|")]
             if len(parts) < max_cols:
-                parts.extend(["""] * (max_cols - len(parts)))
+                parts.extend([""] * (max_cols - len(parts)))
             elif len(parts) > max_cols:
                 parts = parts[:max_cols]
 
