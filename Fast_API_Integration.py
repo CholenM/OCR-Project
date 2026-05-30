@@ -11,7 +11,7 @@ import requests
 app = FastAPI(title="Enterprise Legal OCR Gateway API")
 
 # LAYER 1 (LLAMA CPP)
-LM_STUDIO_URL = "http://192.168.1.91:8000/v1/chat/completions"
+LM_STUDIO_URL = "http://192.168.50.68:8000/v1/chat/completions"
 LM_STUDIO_API_KEY = "sk-ocr-layer1"
 MAX_PAGE_CONCURRENCY = 3
 
@@ -82,6 +82,11 @@ def query_lm_studio_ocr(base64_image: str, mime_type: str = "image/png"):
                     "Second pass: re-scan the top of the page specifically for headers, letterheads, and page titles; add anything missing."
                     "Preserve reading order from top-to-bottom, left-to-right."
                     "Reconstruct tables accurately in Markdown."
+                    "Table rules: use pipe-delimited Markdown tables only; no prose inside tables."
+                    "Each table row MUST have the same number of columns; use empty cells ("
+                    "\"\") to fill missing or merged cells."
+                    "If a header spans multiple columns, duplicate the header text across those columns."
+                    "Do a final table-only recovery pass to fix column alignment and ensure stable row widths."
                 )
             },
             {
@@ -115,6 +120,55 @@ def query_lm_studio_ocr(base64_image: str, mime_type: str = "image/png"):
             return f"\nError (Status {response.status_code}): {response.text}\n", 0, 0
     except Exception as e:
         return f"\nLocal Engine Failed: {str(e)}\n", 0, 0
+
+
+def _normalize_markdown_tables(markdown_text: str) -> str:
+    # Normalizes Markdown tables so each row has a consistent column count.
+    lines = markdown_text.splitlines()
+    output = []
+    in_table = False
+    table_rows = []
+
+    def flush_table():
+        if not table_rows:
+            return
+
+        max_cols = max(row[1] for row in table_rows)
+        for raw_line, col_count in table_rows:
+            stripped = raw_line.strip()
+            if set(stripped.replace("|", "").replace(":", "").replace("-", "")) == {""}:
+                output.append(raw_line)
+                continue
+
+            parts = [p.strip() for p in stripped.strip("|").split("|")]
+            if len(parts) < max_cols:
+                parts.extend([""] * (max_cols - len(parts)))
+            elif len(parts) > max_cols:
+                parts = parts[:max_cols]
+
+            rebuilt = "| " + " | ".join(parts) + " |"
+            output.append(rebuilt)
+
+        table_rows.clear()
+
+    for line in lines:
+        stripped = line.strip()
+        if "|" in stripped and stripped.startswith("|") and stripped.endswith("|"):
+            in_table = True
+            col_count = len(stripped.strip("|").split("|"))
+            table_rows.append((line, col_count))
+            continue
+
+        if in_table:
+            flush_table()
+            in_table = False
+
+        output.append(line)
+
+    if in_table:
+        flush_table()
+
+    return "\n".join(output)
 
 async def query_lm_studio_ocr_async(
     base64_image: str,
@@ -227,6 +281,8 @@ async def process_document(
         "cost_usd": session_cost
     })
     
+    generated_markdown = _normalize_markdown_tables(generated_markdown)
+
     return Response(
         content=generated_markdown,
         media_type="text/markdown",

@@ -69,7 +69,7 @@ with col_dashboard:
                         "Cost ($)", "Input Tokens", "Output Tokens"
                     ]
                     
-                    st.dataframe(df, use_container_width=True, hide_index=True)
+                    st.dataframe(df, use_container_width=True, hide_index=True, height=240)
                 else:
                     st.info("No documents have been processed under this key yet.")
                     
@@ -84,6 +84,7 @@ with col_dashboard:
             st.error("Connection Interrupted: Ensure the FastAPI service is running on port 8000.")
     else:
         st.info("Input API Key in the sidebar to load telemetry.")
+
 
 with col_actions:
     st.header("Batch Pipeline Ingestion")
@@ -142,6 +143,7 @@ with col_actions:
             except Exception as e:
                 st.error(f"Pipeline Fault: {str(e)}")
 
+    # ... existing code ...
     if st.session_state.ocr_result:
         st.download_button(
             label="Download Rendered Markdown",
@@ -151,5 +153,75 @@ with col_actions:
             use_container_width=True
         )
         
-        with st.expander("Preview Extracted Data", expanded=True):
-            st.markdown(st.session_state.ocr_result)
+        # --- NEW: N8N INTEGRATION ---
+        st.markdown("### Export Integrations")
+        n8n_webhook_url = st.text_input(
+            "n8n Webhook URL", 
+            placeholder="http://your-n8n-instance/webhook/ocr-ingest",
+            help="Enter the production or test webhook URL from your n8n workflow."
+        )
+        
+        if st.button("Upload to Vector Store via n8n", use_container_width=True, type="primary"):
+            if not n8n_webhook_url:
+                st.warning("Please provide a valid n8n Webhook URL.")
+            else:
+                with st.spinner("Pushing payload to n8n workflow..."):
+                    payload = {
+                        "filename": uploaded_file.name if uploaded_file else f"document_{int(time.time())}",
+                        "markdown_content": st.session_state.ocr_result,
+                        "timestamp": time.time()
+                    }
+                    try:
+                        n8n_resp = requests.post(n8n_webhook_url, json=payload, timeout=10)
+                        if n8n_resp.status_code == 200:
+                            st.success("Successfully pushed to n8n pipeline!")
+                        else:
+                            st.error(f"n8n Rejected the payload ({n8n_resp.status_code}): {n8n_resp.text}")
+                    except Exception as e:
+                        st.error(f"Network error connecting to n8n: {str(e)}")
+                        
+st.markdown("### Document Preview")
+preview_left, preview_right = st.columns([1, 1], gap="large")
+
+with preview_left:
+    st.subheader("Raw Markdown")
+    if st.session_state.ocr_result:
+        st.text_area("", value=st.session_state.ocr_result, height=520)
+    else:
+        st.info("Run OCR to see the raw Markdown output.")
+
+with preview_right:
+    st.subheader("Rendered Markdown")
+    if st.session_state.ocr_result:
+                rendered_css = """
+                <style>
+                    .streamlit-expanderContent, .stMarkdown {
+                        color: #e5e7eb;
+                    }
+                    .stMarkdown table {
+                        width: 100%;
+                        border-collapse: collapse;
+                        margin: 12px 0 16px 0;
+                        font-size: 0.9rem;
+                    }
+                    .stMarkdown th, .stMarkdown td {
+                        border: 1px solid #2a2f3a;
+                        padding: 6px 8px;
+                        vertical-align: top;
+                        text-align: left;
+                    }
+                    .stMarkdown th {
+                        background: #151925;
+                        font-weight: 600;
+                    }
+                    .stMarkdown hr {
+                        border: 0;
+                        border-top: 1px solid #2a2f3a;
+                        margin: 12px 0;
+                    }
+                </style>
+                """
+                st.markdown(rendered_css, unsafe_allow_html=True)
+                st.markdown(st.session_state.ocr_result, unsafe_allow_html=True)
+    else:
+        st.info("Run OCR to see the rendered Markdown.")
