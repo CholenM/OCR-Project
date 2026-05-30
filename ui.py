@@ -143,6 +143,7 @@ with col_actions:
             except Exception as e:
                 st.error(f"Pipeline Fault: {str(e)}")
 
+    # ... existing code ...
     if st.session_state.ocr_result:
         st.download_button(
             label="Download Rendered Markdown",
@@ -151,7 +152,34 @@ with col_actions:
             mime="text/markdown",
             use_container_width=True
         )
-
+        
+        # --- NEW: N8N INTEGRATION ---
+        st.markdown("### Export Integrations")
+        n8n_webhook_url = st.text_input(
+            "n8n Webhook URL", 
+            placeholder="http://your-n8n-instance/webhook/ocr-ingest",
+            help="Enter the production or test webhook URL from your n8n workflow."
+        )
+        
+        if st.button("Upload to Vector Store via n8n", use_container_width=True, type="primary"):
+            if not n8n_webhook_url:
+                st.warning("Please provide a valid n8n Webhook URL.")
+            else:
+                with st.spinner("Pushing payload to n8n workflow..."):
+                    payload = {
+                        "filename": uploaded_file.name if uploaded_file else f"document_{int(time.time())}",
+                        "markdown_content": st.session_state.ocr_result,
+                        "timestamp": time.time()
+                    }
+                    try:
+                        n8n_resp = requests.post(n8n_webhook_url, json=payload, timeout=10)
+                        if n8n_resp.status_code == 200:
+                            st.success("Successfully pushed to n8n pipeline!")
+                        else:
+                            st.error(f"n8n Rejected the payload ({n8n_resp.status_code}): {n8n_resp.text}")
+                    except Exception as e:
+                        st.error(f"Network error connecting to n8n: {str(e)}")
+                        
 st.markdown("### Document Preview")
 preview_left, preview_right = st.columns([1, 1], gap="large")
 
