@@ -15,6 +15,22 @@ An API-Driven Optical Character Recognition (OCR) System designed to process com
 * [x] Table and complex font recognition *depends on the LLM used*
 * [ ] Multi-Token Prediction (MTP) integration (Exploring)
 
+## Local RAG Ingestion (Ollama + Qdrant)
+This workspace includes a local ingestion pipeline that chunks OCR Markdown, embeds it with Ollama, and stores it in Qdrant. The Streamlit UI exposes a "Send to Local Vector Store" button after OCR completes.
+
+### Prereqs
+* Ollama running locally with the embedding model pulled: `ollama pull qwen3-embedding:8b`
+* Qdrant running locally at `http://localhost:6333`
+* Python packages: `pip install qdrant-client requests`
+
+### Environment Overrides (Optional)
+* `OLLAMA_URL` (default: `http://localhost:11434`)
+* `OLLAMA_EMBED_MODEL` (default: `qwen3-embedding:8b`)
+* `QDRANT_URL` (default: `http://localhost:6333`)
+* `QDRANT_COLLECTION` (default: `ocr_rag`)
+* `RAG_CHUNK_SIZE` (default: `1200`)
+* `RAG_CHUNK_OVERLAP` (default: `150`)
+
 ## Experimentation Log
 
 ### Benchmark 1: Context Size vs Throughput
