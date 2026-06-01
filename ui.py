@@ -303,9 +303,7 @@ with tab_chat:
             if message["role"] == "assistant" and message.get("sources"):
                 with st.expander("Sources"):
                     for source in message["sources"]:
-                        st.markdown(
-                            f"- {source['filename']} (chunk {source['chunk_index']}, score {source['score']:.4f})"
-                        )
+                        st.markdown(f"- {source['filename']}")
 
     prompt = st.chat_input("Ask a question about ingested documents")
     if prompt:
