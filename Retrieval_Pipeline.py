@@ -13,7 +13,7 @@ class RetrievalConfig:
     llm_model: str = os.getenv("OLLAMA_CHAT_MODEL", "nemotron-3-nano:30b-cloud")
     qdrant_url: str = os.getenv("QDRANT_URL", "http://localhost:6333")
     collection: str = os.getenv("QDRANT_COLLECTION", "ocr_rag")
-    top_k: int = int(os.getenv("RAG_TOP_K", "6"))
+    top_k: int = int(os.getenv("RAG_TOP_K", "30"))
     score_threshold: Optional[float] = None
 
 

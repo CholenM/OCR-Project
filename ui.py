@@ -9,7 +9,7 @@ from Retrieval_Pipeline import RetrievalConfig, retrieve_answer
 # --- APPMANAGER CONFIGURATION ---
 FASTAPI_BASE_URL = "http://127.0.0.1:8000"
 
-st.set_page_config(page_title="OCR Control Center", page_icon="", layout="wide")
+st.set_page_config(page_title="Control Center", page_icon="", layout="wide")
 st.title("OCR Control Center")
 st.markdown("""
     <style>
@@ -279,20 +279,32 @@ with tab_ocr:
 with tab_chat:
     st.header("Chat Dashboard")
 
-    config_left, config_right = st.columns(2, gap="medium")
-    with config_left:
-        chat_collection = st.text_input("Qdrant Collection", value="ocr_rag", key="chat_collection")
-        chat_top_k = st.number_input("Top K", min_value=1, max_value=20, value=6, step=1)
+    show_chat_settings = st.toggle("Show Chat Settings", value=False)
 
-    with config_right:
-        chat_embed_model = st.text_input("Embedding Model", value="qwen3-embedding:8b", key="chat_embed_model")
-        chat_llm_model = st.text_input("Chat Model", value="nemotron-3-nano:30b-cloud", key="chat_llm_model")
+    if show_chat_settings:
+        config_left, config_right = st.columns(2, gap="medium")
+        with config_left:
+            chat_collection = st.text_input("Qdrant Collection", value="ocr_rag", key="chat_collection")
+            chat_top_k = st.number_input("Top K", min_value=1, max_value=30, value=30, step=1)
 
-    system_prompt = st.text_area(
-        "System Prompt",
-        value="You are a local RAG assistant. Answer using only the context. If the answer is not in the context, say you do not know.",
-        height=100,
-    )
+        with config_right:
+            chat_embed_model = st.text_input("Embedding Model", value="qwen3-embedding:8b", key="chat_embed_model")
+            chat_llm_model = st.text_input("Chat Model", value="nemotron-3-nano:30b-cloud", key="chat_llm_model")
+
+        system_prompt = st.text_area(
+            "System Prompt",
+            value="You are a local RAG assistant. Answer using only the context. If the answer is not in the context, say you do not know.",
+            height=100,
+        )
+    else:
+        chat_collection = "ocr_rag"
+        chat_top_k = 30
+        chat_embed_model = "qwen3-embedding:8b"
+        chat_llm_model = "nemotron-3-nano:30b-cloud"
+        system_prompt = (
+            "You are a local RAG assistant. Answer using only the context. "
+            "If the answer is not in the context, say you do not know."
+        )
 
     if st.button("Clear Chat", type="secondary"):
         st.session_state.chat_messages = []
