@@ -1,8 +1,11 @@
 """
 OCR + RAG Control Center — Session-Based UI
 =============================================
-Each chat session creates its own Qdrant vector store.
-Users choose what documents to ingest per session.
+Features:
+  - Multi-file upload with batch queue (3 at a time)
+  - Per-session Qdrant collections
+  - Conversational memory
+  - Dynamic processing feedback
 
 Usage:
     pip install streamlit requests pandas
@@ -10,6 +13,7 @@ Usage:
 """
 
 import os, time, uuid, json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 import requests
 import pandas as pd
@@ -17,6 +21,7 @@ import pandas as pd
 DEFAULT_OCR_URL = os.getenv("OCR_API_URL", "http://192.168.50.153:8080")
 DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 QDRANT_DASHBOARD = os.getenv("QDRANT_DASHBOARD", "http://192.168.50.153:6333/dashboard")
+BATCH_SIZE = 3  # Process N files concurrently
 
 st.set_page_config(page_title="OCR + RAG Control Center", page_icon="", layout="wide")
 st.title("OCR + RAG Control Center")
@@ -55,7 +60,6 @@ def _headers():
     return {"X-API-KEY": api_key_input} if api_key_input else {}
 
 def load_sessions():
-    """Fetch session list from RAG pipeline."""
     if not api_key_input:
         return []
     try:
@@ -67,20 +71,14 @@ def load_sessions():
     return []
 
 # Initialize session state
-if "ocr_result" not in st.session_state:
-    st.session_state.ocr_result = None
-if "chat_messages" not in st.session_state:
-    st.session_state.chat_messages = []
-if "active_session" not in st.session_state:
-    st.session_state.active_session = None
-if "session_list" not in st.session_state:
-    st.session_state.session_list = []
+for key, default in [("ocr_results", {}), ("chat_messages", []),
+                     ("active_session", None), ("session_list", [])]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# Refresh sessions
 if st.sidebar.button("🔄 Refresh Sessions"):
     st.session_state.session_list = load_sessions()
 
-# Create new session
 with st.sidebar.expander("➕ Create New Session"):
     new_name = st.text_input("Session Name", placeholder="e.g. Legal Contracts Q4")
     if st.button("Create", use_container_width=True):
@@ -104,7 +102,6 @@ with st.sidebar.expander("➕ Create New Session"):
             except Exception as e:
                 st.error(str(e))
 
-# Session selector
 sessions = st.session_state.session_list
 session_names = [s["name"] for s in sessions]
 if session_names:
@@ -115,15 +112,12 @@ if session_names:
         st.session_state.active_session = selected
         st.session_state.chat_messages = []
         st.rerun()
-
-    # Show session info
     match = next((s for s in sessions if s["name"] == selected), None)
     if match:
         st.sidebar.caption(f"📊 {match.get('points', 0)} vectors stored")
 else:
     st.sidebar.info("No sessions yet. Create one above.")
 
-# Delete session
 if st.session_state.active_session and api_key_input:
     if st.sidebar.button("🗑️ Delete Active Session", type="secondary"):
         try:
@@ -138,6 +132,26 @@ if st.session_state.active_session and api_key_input:
         except Exception as e:
             st.sidebar.error(str(e))
 
+
+# ========================================================================
+# OCR Processing Worker (runs in thread)
+# ========================================================================
+
+def _ocr_single_file(file_name, file_bytes, content_type, ocr_endpoint, headers, params):
+    """Process one file through OCR. Returns (name, markdown, latency, tps, error)."""
+    try:
+        files = {"file": (file_name, file_bytes, content_type)}
+        r = requests.post(ocr_endpoint, headers=headers, files=files, params=params, timeout=300)
+        if r.status_code == 200:
+            lat = float(r.headers.get("X-Process-Time", 0))
+            tps = float(r.headers.get("X-Tokens-Per-Sec", 0))
+            return (file_name, r.text, lat, tps, None)
+        else:
+            return (file_name, None, 0, 0, f"HTTP {r.status_code}")
+    except Exception as e:
+        return (file_name, None, 0, 0, str(e))
+
+
 # ========================================================================
 # Tabs
 # ========================================================================
@@ -149,14 +163,11 @@ tab_ocr, tab_chat = st.tabs(["OCR Dashboard", "Chat Dashboard"])
 with tab_ocr:
     st.header("OCR Dashboard")
 
-    # --- Advanced Settings ---
     with st.expander("⚙️ Advanced Settings"):
         adv_c1, adv_c2 = st.columns(2)
         with adv_c1:
-            st.markdown(f"**Qdrant Dashboard**")
             st.link_button("🔗 Open Qdrant Vector Store", QDRANT_DASHBOARD, use_container_width=True)
         with adv_c2:
-            st.markdown(f"**RAG API Docs**")
             st.link_button("🔗 Open Swagger UI", f"{rag_url}/docs", use_container_width=True)
 
     col_dash, col_act = st.columns([1.3, 1], gap="large")
@@ -191,92 +202,214 @@ with tab_ocr:
 
     with col_act:
         st.subheader("Document Processing")
-        uploaded_file = st.file_uploader("Upload Document", type=["pdf", "jpg", "png"])
-        is_pdf = uploaded_file is not None and uploaded_file.type == "application/pdf"
 
-        if is_pdf:
+        # --- Multi-file upload ---
+        uploaded_files = st.file_uploader(
+            "Upload Documents (PDF, JPG, PNG)",
+            type=["pdf", "jpg", "png"],
+            accept_multiple_files=True,
+        )
+
+        if uploaded_files:
+            st.caption(f"**{len(uploaded_files)} file(s)** queued • Batch size: {BATCH_SIZE}")
+
+        # PDF-specific settings
+        has_pdf = any(f.type == "application/pdf" for f in (uploaded_files or []))
+        if has_pdf:
             dpi_value = st.slider("Render DPI", 120, 350, 200, 10)
             mode_value = st.selectbox("Mode", ["serial", "concurrent"], index=1)
             max_conc = st.number_input("Max Concurrency", 1, 8, 4, 1) if mode_value == "concurrent" else None
         else:
-            dpi_value = mode_value = max_conc = None
+            dpi_value, mode_value, max_conc = 200, "concurrent", 4
 
-        if st.button("Execute OCR", use_container_width=True, type="primary"):
-            if not api_key_input or not uploaded_file:
-                st.warning("Provide API key and upload a file.")
+        # --- Execute OCR with Queue ---
+        if st.button("🚀 Execute OCR", use_container_width=True, type="primary"):
+            if not api_key_input:
+                st.warning("Enter API key in sidebar.")
+            elif not uploaded_files:
+                st.warning("Upload at least one file.")
             else:
-                with st.spinner("Processing via OCR Pipeline..."):
-                    files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-                    params = {}
-                    if is_pdf:
-                        params["dpi"] = dpi_value
-                        params["mode"] = mode_value
-                        if max_conc:
-                            params["max_concurrency"] = int(max_conc)
-                    try:
-                        r = requests.post(f"{ocr_url}/v1/ocr", headers=_headers(), files=files, params=params)
-                        if r.status_code == 200:
-                            st.session_state.ocr_result = r.text
-                            lat = float(r.headers.get("X-Process-Time", 0))
-                            tps = float(r.headers.get("X-Tokens-Per-Sec", 0))
-                            st.success(f"Done in {lat}s | {tps:.1f} tok/s")
-                            st.rerun()
-                        else:
-                            st.error(f"Error ({r.status_code}): {r.text}")
-                    except Exception as e:
-                        st.error(f"Failed: {e}")
+                total = len(uploaded_files)
+                completed = 0
+                results = {}
+                errors = []
 
-        # Post-OCR: Ingest into active session
-        if st.session_state.ocr_result:
-            st.download_button("Download Markdown", data=st.session_state.ocr_result,
-                               file_name=f"ocr_{int(time.time())}.md",
-                               mime="text/markdown", use_container_width=True)
+                # Build params
+                params = {"dpi": dpi_value, "mode": mode_value}
+                if max_conc:
+                    params["max_concurrency"] = int(max_conc)
 
+                # Prepare file data (read bytes before threading)
+                file_data = []
+                for f in uploaded_files:
+                    file_data.append((f.name, f.getvalue(), f.type))
+
+                with st.status(f"Processing {total} file(s)...", expanded=True) as status_box:
+                    overall_start = time.time()
+                    progress_bar = st.progress(0, text=f"0 / {total} files processed")
+
+                    # Process in batches
+                    for batch_start in range(0, total, BATCH_SIZE):
+                        batch = file_data[batch_start:batch_start + BATCH_SIZE]
+                        batch_num = (batch_start // BATCH_SIZE) + 1
+                        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
+
+                        st.write(f"**Batch {batch_num}/{total_batches}** — {len(batch)} file(s)")
+
+                        # Show "processing" for each file in this batch
+                        file_slots = {}
+                        for fname, _, _ in batch:
+                            file_slots[fname] = st.empty()
+                            file_slots[fname].markdown(f"🔄 `{fname}` — *Processing...*")
+
+                        # Process batch concurrently
+                        with ThreadPoolExecutor(max_workers=BATCH_SIZE) as executor:
+                            futures = {}
+                            for fname, fbytes, ftype in batch:
+                                future = executor.submit(
+                                    _ocr_single_file, fname, fbytes, ftype,
+                                    f"{ocr_url}/v1/ocr", _headers(), params,
+                                )
+                                futures[future] = fname
+
+                            for future in as_completed(futures):
+                                fname = futures[future]
+                                name, markdown, latency, tps, error = future.result()
+
+                                if error:
+                                    file_slots[fname].markdown(f"❌ `{name}` — **Failed:** {error}")
+                                    errors.append(name)
+                                else:
+                                    file_slots[fname].markdown(
+                                        f"✅ `{name}` — **Done** in {latency:.1f}s ({tps:.0f} tok/s)"
+                                    )
+                                    results[name] = markdown
+
+                                completed += 1
+                                pct = completed / total
+                                elapsed = time.time() - overall_start
+                                eta = (elapsed / completed) * (total - completed) if completed > 0 else 0
+                                progress_bar.progress(
+                                    pct,
+                                    text=f"{completed} / {total} files • "
+                                         f"Elapsed: {elapsed:.0f}s • ETA: {eta:.0f}s",
+                                )
+
+                    # Final summary
+                    total_time = time.time() - overall_start
+                    if errors:
+                        status_box.update(
+                            label=f"Completed: {len(results)} ✅ | Failed: {len(errors)} ❌ | {total_time:.1f}s",
+                            state="error",
+                        )
+                    else:
+                        status_box.update(
+                            label=f"All {total} files processed in {total_time:.1f}s ✅",
+                            state="complete",
+                        )
+
+                # Store results
+                if results:
+                    st.session_state.ocr_results.update(results)
+                    st.rerun()
+
+        # --- Results Display & Ingestion ---
+        if st.session_state.ocr_results:
+            result_names = list(st.session_state.ocr_results.keys())
+            st.markdown(f"### Processed Files ({len(result_names)})")
+
+            # Combined download
+            combined = ""
+            for fname, md in st.session_state.ocr_results.items():
+                combined += f"\n<!-- FILE: {fname} -->\n{md}\n"
+            st.download_button(
+                "📥 Download All (Combined Markdown)",
+                data=combined,
+                file_name=f"ocr_batch_{int(time.time())}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+
+            # Ingestion
             st.markdown("### Ingest to Session")
             target = st.session_state.active_session
             if target:
-                st.info(f"Will ingest into session: **{target}**")
+                st.info(f"Will ingest **{len(result_names)} file(s)** into session: **{target}**")
                 chunk_size = st.number_input("Max Chunk Size", 200, 4000, 1200, 50)
-                if st.button("Ingest to Vector Store", use_container_width=True, type="primary"):
-                    with st.spinner("Structural chunking + embedding..."):
-                        try:
+
+                ingest_mode = st.radio(
+                    "Ingestion mode",
+                    ["All files together", "Each file separately"],
+                    index=1,
+                    horizontal=True,
+                )
+
+                if st.button("📤 Ingest to Vector Store", use_container_width=True, type="primary"):
+                    with st.status(f"Ingesting {len(result_names)} file(s)...", expanded=True) as ing_status:
+
+                        if ingest_mode == "All files together":
+                            st.write("Sending combined markdown...")
                             payload = {
-                                "filename": uploaded_file.name if uploaded_file else f"doc_{int(time.time())}",
-                                "markdown_content": st.session_state.ocr_result,
+                                "filename": "batch_" + "_".join(result_names[:3]),
+                                "markdown_content": combined,
                                 "collection": target,
                                 "chunk_size": int(chunk_size),
                             }
                             r = requests.post(f"{rag_url}/v1/ingest", headers=_headers(), json=payload)
                             if r.status_code == 200:
                                 res = r.json()
-                                st.success(f"Ingested {res['chunks']} chunks → '{res['collection']}'")
-                                if res.get("sections"):
-                                    st.markdown("**Sections detected:**")
-                                    for sec, cnt in res["sections"].items():
-                                        st.write(f"  • {sec}: {cnt} chunk(s)")
-                                st.session_state.session_list = load_sessions()
+                                st.write(f"✅ Ingested {res['chunks']} chunks")
                             else:
-                                st.error(f"Failed: {r.text}")
-                        except Exception as e:
-                            st.error(f"Error: {e}")
+                                st.write(f"❌ Failed: {r.text}")
+                        else:
+                            total_chunks = 0
+                            for i, (fname, md) in enumerate(st.session_state.ocr_results.items()):
+                                st.write(f"🔄 Ingesting `{fname}` ({i+1}/{len(result_names)})...")
+                                payload = {
+                                    "filename": fname,
+                                    "markdown_content": md,
+                                    "collection": target,
+                                    "chunk_size": int(chunk_size),
+                                }
+                                try:
+                                    r = requests.post(f"{rag_url}/v1/ingest",
+                                                      headers=_headers(), json=payload, timeout=120)
+                                    if r.status_code == 200:
+                                        res = r.json()
+                                        chunks = res["chunks"]
+                                        total_chunks += chunks
+                                        st.write(f"✅ `{fname}` — {chunks} chunks")
+                                    else:
+                                        st.write(f"❌ `{fname}` — {r.text}")
+                                except Exception as e:
+                                    st.write(f"❌ `{fname}` — {e}")
+
+                            ing_status.update(
+                                label=f"Ingested {total_chunks} total chunks from {len(result_names)} files ✅",
+                                state="complete",
+                            )
+                        st.session_state.session_list = load_sessions()
             else:
                 st.warning("Create or select a session in the sidebar first.")
 
-    # Document preview
-    st.markdown("### Document Preview")
-    left, right = st.columns(2, gap="large")
-    with left:
-        st.subheader("Raw Markdown")
-        if st.session_state.ocr_result:
-            st.text_area("", value=st.session_state.ocr_result, height=520)
-        else:
-            st.info("Run OCR to see output.")
-    with right:
-        st.subheader("Rendered Markdown")
-        if st.session_state.ocr_result:
-            st.markdown(st.session_state.ocr_result, unsafe_allow_html=True)
-        else:
-            st.info("Run OCR to see rendered output.")
+            # Per-file preview
+            st.markdown("### Document Preview")
+            preview_file = st.selectbox("Select file to preview", result_names)
+            if preview_file:
+                md_content = st.session_state.ocr_results[preview_file]
+                left, right = st.columns(2, gap="large")
+                with left:
+                    st.subheader("Raw Markdown")
+                    st.text_area("raw_md", value=md_content, height=520, label_visibility="collapsed")
+                with right:
+                    st.subheader("Rendered Markdown")
+                    st.markdown(md_content, unsafe_allow_html=True)
+
+            # Clear results
+            if st.button("🗑️ Clear All OCR Results"):
+                st.session_state.ocr_results = {}
+                st.rerun()
+
 
 # ========================================================================
 # Chat Dashboard
@@ -290,7 +423,6 @@ with tab_chat:
     else:
         st.warning("Select or create a session in the sidebar to start chatting.")
 
-    # --- Advanced Settings ---
     with st.expander("⚙️ Advanced Settings"):
         adv_c1, adv_c2 = st.columns(2)
         with adv_c1:
@@ -304,13 +436,14 @@ with tab_chat:
             memory_enabled = st.checkbox("Enable Memory", value=True)
         with cr:
             memory_top_k = st.number_input("Memory Top K", 1, 20, 5, 1)
-            system_prompt = st.text_area("System Prompt",
+            system_prompt = st.text_area(
+                "System Prompt",
                 value="You are a local RAG assistant. Answer using only the context. "
                       "Use conversation history for follow-up context when available. "
                       "If the answer is not in the context, say you do not know.",
-                height=100)
+                height=100,
+            )
 
-        # Session info
         if active and api_key_input:
             try:
                 r = requests.get(f"{rag_url}/v1/sessions/{active}", headers=_headers(), timeout=5)
@@ -321,14 +454,9 @@ with tab_chat:
             except Exception:
                 pass
 
-    # Use expander defaults if Advanced Settings is closed
     if "chat_top_k" not in dir():
-        chat_top_k = 30
-        memory_enabled = True
-        memory_top_k = 5
-        system_prompt = None
+        chat_top_k, memory_enabled, memory_top_k, system_prompt = 30, True, 5, None
 
-    # Clear chat + memory
     if st.button("Clear Chat & Memory", type="secondary"):
         if api_key_input and active:
             try:
@@ -338,7 +466,6 @@ with tab_chat:
         st.session_state.chat_messages = []
         st.rerun()
 
-    # Chat messages
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
@@ -360,30 +487,22 @@ with tab_chat:
         with st.spinner("Querying RAG Pipeline..."):
             try:
                 payload = {
-                    "query": prompt,
-                    "collection": active,
-                    "top_k": int(chat_top_k),
-                    "session_id": active,  # Use collection name as session_id for memory
-                    "memory_enabled": memory_enabled,
-                    "memory_top_k": int(memory_top_k),
+                    "query": prompt, "collection": active,
+                    "top_k": int(chat_top_k), "session_id": active,
+                    "memory_enabled": memory_enabled, "memory_top_k": int(memory_top_k),
                 }
                 if system_prompt:
                     payload["system_prompt"] = system_prompt
                 r = requests.post(f"{rag_url}/v1/chat", headers=_headers(), json=payload, timeout=180)
                 if r.status_code == 200:
                     res = r.json()
-                    answer = res["answer"]
-                    sources = res.get("sources", [])
-                    memories = res.get("memories", [])
+                    answer, sources, memories = res["answer"], res.get("sources", []), res.get("memories", [])
                 else:
-                    answer = f"Error: {r.text}"
-                    sources, memories = [], []
+                    answer, sources, memories = f"Error: {r.text}", [], []
             except Exception as e:
-                answer = f"Failed: {e}"
-                sources, memories = [], []
+                answer, sources, memories = f"Failed: {e}", [], []
         st.session_state.chat_messages.append({
-            "role": "assistant", "content": answer,
-            "sources": sources, "memories": memories,
+            "role": "assistant", "content": answer, "sources": sources, "memories": memories,
         })
         st.rerun()
     elif prompt and not active:
