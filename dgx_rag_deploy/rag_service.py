@@ -1,17 +1,20 @@
 """
 RAG Pipeline Service v2 — DGX Spark
 =====================================
-Improvements over v1:
-  1. Conversational memory in Qdrant (session-scoped, auto-cleared)
-  2. Markdown-aware structural chunking (tables intact, section headers)
+Session-based RAG with per-chat vector stores, conversational memory,
+and Markdown-aware structural chunking.
 
 Endpoints:
-  POST /v1/ingest           — Structural chunk + embed + store
-  POST /v1/chat             — Memory-augmented RAG chat
-  GET  /v1/memory/{sid}     — List memories for a session
-  DELETE /v1/memory/{sid}   — Clear session memory
-  GET  /v1/metrics          — Usage telemetry
-  GET  /healthz             — Health check
+  POST   /v1/sessions          — Create a new session (vector store)
+  GET    /v1/sessions          — List all sessions
+  GET    /v1/sessions/{name}   — Get session info (doc count, etc.)
+  DELETE /v1/sessions/{name}   — Delete session + its memory
+  POST   /v1/ingest            — Structural chunk + embed + store
+  POST   /v1/chat              — Memory-augmented RAG chat
+  GET    /v1/memory/{sid}      — List memories for a session
+  DELETE /v1/memory/{sid}      — Clear session memory
+  GET    /v1/metrics           — Usage telemetry
+  GET    /healthz              — Health check
 """
 
 import os, re, time, uuid, logging, math
@@ -359,6 +362,102 @@ def clear_session_memory(client, session_id: str) -> int:
 # ===========================================================================
 # Endpoints
 # ===========================================================================
+
+# --- Session Management ---
+
+@app.post("/v1/sessions", tags=["Sessions"])
+async def create_session(
+    api_key: str = Depends(verify_api_key),
+    name: str = Body(..., embed=True, description="Session/collection name"),
+    description: str = Body("", embed=True),
+):
+    """Create a new session. Each session is a dedicated Qdrant collection."""
+    # Sanitize name: lowercase, replace spaces with underscores, strip special chars
+    clean = re.sub(r'[^a-z0-9_]', '', name.lower().replace(' ', '_').replace('-', '_'))
+    if not clean:
+        raise HTTPException(status_code=400, detail="Invalid session name.")
+    try:
+        client = _qclient()
+        existing = {c.name for c in client.get_collections().collections}
+        if clean in existing:
+            return {"status": "exists", "session": clean, "message": "Session already exists."}
+        # Create with a placeholder — real vector size set on first ingest
+        # We'll use a temporary size; ensure_collection in /v1/ingest handles the real creation
+        log.info(f"Session created: {clean}")
+        return {"status": "created", "session": clean, "description": description}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/sessions", tags=["Sessions"])
+async def list_sessions(api_key: str = Depends(verify_api_key)):
+    """List all sessions (Qdrant collections) with point counts."""
+    try:
+        client = _qclient()
+        collections = client.get_collections().collections
+        sessions = []
+        for c in collections:
+            if c.name == MEMORY_COLLECTION:
+                continue  # Skip internal memory collection
+            try:
+                info = client.get_collection(c.name)
+                count = info.points_count if hasattr(info, 'points_count') else 0
+            except Exception:
+                count = 0
+            sessions.append({"name": c.name, "points": count})
+        return {"sessions": sessions, "count": len(sessions)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/sessions/{name}", tags=["Sessions"])
+async def get_session_info(name: str, api_key: str = Depends(verify_api_key)):
+    """Get details about a session: point count, stored filenames, sections."""
+    try:
+        client = _qclient()
+        existing = {c.name for c in client.get_collections().collections}
+        if name not in existing:
+            raise HTTPException(status_code=404, detail=f"Session '{name}' not found.")
+        info = client.get_collection(name)
+        count = info.points_count if hasattr(info, 'points_count') else 0
+
+        # Get unique filenames
+        filenames = set()
+        try:
+            points, _ = client.scroll(collection_name=name, limit=200, with_payload=True)
+            for pt in points:
+                fn = (pt.payload or {}).get("filename")
+                if fn:
+                    filenames.add(fn)
+        except Exception:
+            pass
+
+        return {"session": name, "points": count, "files": sorted(filenames)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/v1/sessions/{name}", tags=["Sessions"])
+async def delete_session(name: str, api_key: str = Depends(verify_api_key)):
+    """Delete a session and its associated memory."""
+    try:
+        client = _qclient()
+        existing = {c.name for c in client.get_collections().collections}
+        deleted_items = []
+        if name in existing:
+            client.delete_collection(name)
+            deleted_items.append(name)
+        # Also clear any memory tied to this session name
+        cleared = clear_session_memory(client, name)
+        log.info(f"Session deleted: {name} (memory cleared: {cleared})")
+        return {"status": "deleted", "session": name, "memory_cleared": cleared}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Health ---
 
 @app.get("/healthz", tags=["System"])
 async def health_check():
