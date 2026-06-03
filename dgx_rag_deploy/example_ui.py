@@ -2,21 +2,19 @@
 Example UI — OCR + RAG Pipeline Client (Streamlit)
 ====================================================
 Connects to TWO separate services on the DGX Spark:
-  - OCR Pipeline at :8080 (~/ocr-pipeline/)
-  - RAG Pipeline at :8081 (~/rag-pipeline/)
+  - OCR Pipeline at :8080
+  - RAG Pipeline at :8081 (v2 with memory + structural chunking)
 
 Usage:
     pip install streamlit requests pandas
     streamlit run example_ui.py
 """
 
-import os
-import time
+import os, time, uuid
 import streamlit as st
 import requests
 import pandas as pd
 
-# --- Defaults ---
 DEFAULT_OCR_URL = os.getenv("OCR_API_URL", "http://192.168.50.153:8080")
 DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 
@@ -49,16 +47,18 @@ if st.sidebar.button("Health Check"):
         except Exception as e:
             st.sidebar.error(f"{name}: {e}")
 
-# Session state
+# Session state initialization
 if "ocr_result" not in st.session_state:
     st.session_state.ocr_result = None
 if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 tab_ocr, tab_chat = st.tabs(["OCR Dashboard", "Chat Dashboard"])
 
 # ===========================================================================
-# OCR Dashboard (talks to ocr-pipeline :8080)
+# OCR Dashboard
 # ===========================================================================
 with tab_ocr:
     st.header("OCR Dashboard")
@@ -68,8 +68,7 @@ with tab_ocr:
         st.header("OCR Metrics")
         if api_key_input:
             try:
-                resp = requests.get(f"{ocr_url}/v1/metrics",
-                                    headers={"X-API-KEY": api_key_input})
+                resp = requests.get(f"{ocr_url}/v1/metrics", headers={"X-API-KEY": api_key_input})
                 if resp.status_code == 200:
                     data = resp.json()
                     metrics = data["metrics"]
@@ -78,20 +77,18 @@ with tab_ocr:
                     cap = data["monthly_spend_cap"]
                     st.progress(min(spend / cap, 1.0) if cap > 0 else 0)
                     st.caption(f"**${spend:.2f}** of **${cap:.2f}**")
-
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Docs", metrics["total_documents"])
                     c2.metric("Pages", metrics["total_pages_processed"])
                     tok = metrics["total_input_tokens"] + metrics["total_output_tokens"]
                     c3.metric("Tokens", f"{tok:,}")
-
                     if data["audit_logs"]:
-                        df = pd.DataFrame(data["audit_logs"])
-                        st.dataframe(df, use_container_width=True, hide_index=True, height=240)
+                        st.dataframe(pd.DataFrame(data["audit_logs"]),
+                                     use_container_width=True, hide_index=True, height=240)
                 elif resp.status_code == 401:
                     st.error("Invalid API Key.")
             except requests.exceptions.ConnectionError:
-                st.error(f"Cannot connect to OCR pipeline at {ocr_url}")
+                st.error(f"Cannot connect to {ocr_url}")
         else:
             st.info("Enter API Key in sidebar.")
 
@@ -104,10 +101,7 @@ with tab_ocr:
             dpi_value = st.slider("Render DPI", 120, 350, 200, 10)
             mode_label = st.selectbox("Mode", ["Serial", "Concurrent"], index=1)
             mode_value = mode_label.lower()
-            if mode_value == "concurrent":
-                max_conc = st.number_input("Max Concurrency", 1, 8, 4, 1)
-            else:
-                max_conc = None
+            max_conc = st.number_input("Max Concurrency", 1, 8, 4, 1) if mode_value == "concurrent" else None
         else:
             dpi_value = mode_value = max_conc = None
 
@@ -125,8 +119,7 @@ with tab_ocr:
                         if max_conc:
                             params["max_concurrency"] = int(max_conc)
                     try:
-                        r = requests.post(f"{ocr_url}/v1/ocr",
-                                          headers=headers, files=files, params=params)
+                        r = requests.post(f"{ocr_url}/v1/ocr", headers=headers, files=files, params=params)
                         if r.status_code == 200:
                             st.session_state.ocr_result = r.text
                             lat = float(r.headers.get("X-Process-Time", 0))
@@ -138,43 +131,41 @@ with tab_ocr:
                     except Exception as e:
                         st.error(f"Failed: {e}")
 
-        # Post-OCR actions
         if st.session_state.ocr_result:
             st.download_button("Download Markdown", data=st.session_state.ocr_result,
                                file_name=f"ocr_{int(time.time())}.md",
                                mime="text/markdown", use_container_width=True)
 
-            # RAG Ingestion (talks to rag-pipeline :8081)
-            st.markdown("### RAG Ingestion")
+            st.markdown("### RAG Ingestion (Structural Chunking)")
             col_l, col_r = st.columns(2, gap="medium")
             with col_l:
                 collection = st.text_input("Collection", value="ocr_rag")
-                chunk_size = st.number_input("Chunk Size", 200, 4000, 1200, 50)
             with col_r:
-                chunk_overlap = st.number_input("Overlap", 0, 1000, 150, 25)
+                chunk_size = st.number_input("Max Chunk Size", 200, 4000, 1200, 50)
 
             if st.button("Ingest to Vector Store", use_container_width=True, type="primary"):
-                with st.spinner("Sending to RAG Pipeline for embedding..."):
+                with st.spinner("Structural chunking + embedding..."):
                     try:
                         payload = {
                             "filename": uploaded_file.name if uploaded_file else f"doc_{int(time.time())}",
                             "markdown_content": st.session_state.ocr_result,
                             "collection": collection,
                             "chunk_size": int(chunk_size),
-                            "chunk_overlap": int(chunk_overlap),
                         }
                         r = requests.post(f"{rag_url}/v1/ingest",
-                                          headers={"X-API-KEY": api_key_input},
-                                          json=payload)
+                                          headers={"X-API-KEY": api_key_input}, json=payload)
                         if r.status_code == 200:
                             res = r.json()
                             st.success(f"Ingested {res['chunks']} chunks → '{res['collection']}'")
+                            if res.get("sections"):
+                                st.markdown("**Sections detected:**")
+                                for sec, cnt in res["sections"].items():
+                                    st.write(f"  • {sec}: {cnt} chunk(s)")
                         else:
-                            st.error(f"Ingestion failed: {r.text}")
+                            st.error(f"Failed: {r.text}")
                     except Exception as e:
                         st.error(f"Error: {e}")
 
-    # Preview
     st.markdown("### Document Preview")
     left, right = st.columns(2, gap="large")
     with left:
@@ -191,10 +182,11 @@ with tab_ocr:
             st.info("Run OCR to see rendered output.")
 
 # ===========================================================================
-# Chat Dashboard (talks to rag-pipeline :8081)
+# Chat Dashboard (with memory)
 # ===========================================================================
 with tab_chat:
     st.header("Chat Dashboard")
+    st.caption(f"Session: `{st.session_state.session_id[:8]}...`")
 
     show_settings = st.toggle("Show Settings", value=False)
     if show_settings:
@@ -203,52 +195,83 @@ with tab_chat:
             chat_collection = st.text_input("Collection", value="ocr_rag", key="chat_col")
             chat_top_k = st.number_input("Top K", 1, 50, 30, 1)
         with cr:
+            memory_enabled = st.checkbox("Enable Memory", value=True)
+            memory_top_k = st.number_input("Memory Top K", 1, 20, 5, 1)
             system_prompt = st.text_area("System Prompt",
                 value="You are a local RAG assistant. Answer using only the context. "
+                      "Use conversation history for follow-up context when available. "
                       "If the answer is not in the context, say you do not know.",
                 height=100)
     else:
         chat_collection = "ocr_rag"
         chat_top_k = 30
-        system_prompt = ("You are a local RAG assistant. Answer using only the context. "
-                         "If the answer is not in the context, say you do not know.")
+        memory_enabled = True
+        memory_top_k = 5
+        system_prompt = None
 
-    if st.button("Clear Chat", type="secondary"):
+    # Clear chat = clear messages + clear memory in Qdrant + new session
+    if st.button("Clear Chat & Memory", type="secondary"):
+        if api_key_input:
+            try:
+                requests.delete(f"{rag_url}/v1/memory/{st.session_state.session_id}",
+                                headers={"X-API-KEY": api_key_input}, timeout=5)
+            except Exception:
+                pass
         st.session_state.chat_messages = []
+        st.session_state.session_id = str(uuid.uuid4())
+        st.rerun()
 
+    # Display messages
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            if msg["role"] == "assistant" and msg.get("sources"):
-                with st.expander("Sources"):
-                    for s in msg["sources"]:
-                        st.markdown(f"- **{s['filename']}** (chunk {s['chunk_index']}, score {s['score']:.4f})")
+            if msg["role"] == "assistant":
+                # Document sources
+                if msg.get("sources"):
+                    with st.expander(f"📄 Document Sources ({len(msg['sources'])})"):
+                        for s in msg["sources"]:
+                            sec = s.get("section", "")
+                            st.markdown(f"- **{s['filename']}** | {sec} | "
+                                        f"{s.get('content_type', '')} | score {s['score']:.4f}")
+                # Memory sources
+                if msg.get("memories"):
+                    with st.expander(f"🧠 Memory Context ({len(msg['memories'])})"):
+                        for m in msg["memories"]:
+                            st.markdown(f"- **Q:** {m['query'][:80]}...")
+                            st.markdown(f"  **A:** {m['answer'][:120]}...")
 
     prompt = st.chat_input("Ask about ingested documents")
     if prompt:
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
+
         with st.spinner("Querying RAG Pipeline..."):
             try:
                 payload = {
                     "query": prompt,
                     "collection": chat_collection,
                     "top_k": int(chat_top_k),
-                    "system_prompt": system_prompt,
+                    "session_id": st.session_state.session_id,
+                    "memory_enabled": memory_enabled,
+                    "memory_top_k": int(memory_top_k),
                 }
+                if system_prompt:
+                    payload["system_prompt"] = system_prompt
                 r = requests.post(f"{rag_url}/v1/chat",
-                                  headers={"X-API-KEY": api_key_input},
-                                  json=payload, timeout=180)
+                                  headers={"X-API-KEY": api_key_input}, json=payload, timeout=180)
                 if r.status_code == 200:
                     res = r.json()
-                    answer, sources = res["answer"], res["sources"]
+                    answer = res["answer"]
+                    sources = res.get("sources", [])
+                    memories = res.get("memories", [])
                 else:
                     answer = f"Error: {r.text}"
-                    sources = []
+                    sources, memories = [], []
             except Exception as e:
                 answer = f"Failed: {e}"
-                sources = []
+                sources, memories = [], []
 
-        st.session_state.chat_messages.append(
-            {"role": "assistant", "content": answer, "sources": sources}
-        )
+        st.session_state.chat_messages.append({
+            "role": "assistant", "content": answer,
+            "sources": sources, "memories": memories,
+        })
         st.rerun()
