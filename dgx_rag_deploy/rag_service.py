@@ -17,7 +17,7 @@ Endpoints:
   GET    /healthz              — Health check
 """
 
-import os, re, time, uuid, logging, math
+import os, re, time, uuid, logging, math, json
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -54,6 +54,7 @@ RAG_CHUNK_SIZE    = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
 RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "30"))
 MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "5"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
+AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
 
 # ---------------------------------------------------------------------------
 # API Key DB
@@ -119,6 +120,82 @@ def chat_completion(messages: List[Dict], temperature: float = 0.7) -> str:
     if r.status_code != 200:
         raise RuntimeError(f"Chat failed: {r.status_code} {r.text}")
     return r.json()["choices"][0]["message"]["content"]
+
+
+# ===========================================================================
+# Metadata: Auto-Tagging & Filter Extraction
+# ===========================================================================
+
+AUTOTAG_PROMPT = """Analyze this document and return ONLY a valid JSON object with these fields:
+{
+  "doc_type": "invoice|contract|report|letter|memo|receipt|policy|form|certificate|other",
+  "date": "YYYY-MM-DD or null if not found",
+  "parties": ["list of people or organizations mentioned"],
+  "tags": ["3-7 relevant topic keywords"],
+  "summary": "One concise sentence describing the document"
+}
+
+Rules:
+- Return ONLY the JSON, no explanation
+- Use lowercase for doc_type and tags
+- If a field cannot be determined, use null or empty list
+
+Document:
+---
+{text}
+---"""
+
+FILTER_EXTRACT_PROMPT = """Given this user query, extract metadata filters to narrow document search.
+Return ONLY a valid JSON object. Only include fields you can confidently extract.
+Return {} if no filters can be extracted.
+
+Available filters:
+- "doc_type": string (invoice, contract, report, letter, memo, receipt, policy, form, certificate)
+- "tags": list of keyword strings
+- "parties": list of people/organization names
+- "date_from": "YYYY-MM-DD" (documents from this date onwards)
+- "date_to": "YYYY-MM-DD" (documents up to this date)
+- "filename": partial filename match
+
+Query: {query}"""
+
+
+def autotag_document(markdown_text: str) -> dict:
+    """Use Chat LLM to auto-generate metadata tags from document text."""
+    snippet = (markdown_text or "")[:AUTOTAG_MAX_CHARS]
+    if not snippet.strip():
+        return {}
+    try:
+        prompt = AUTOTAG_PROMPT.replace("{text}", snippet)
+        raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.1)
+        # Extract JSON from response (handle markdown code blocks)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        result = json.loads(cleaned)
+        # Ensure expected fields exist
+        schema = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+        for k, default in schema.items():
+            if k not in result:
+                result[k] = default
+        return result
+    except Exception as e:
+        log.warning(f"Auto-tag failed: {e}")
+        return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": "", "_error": str(e)}
+
+
+def extract_filters_from_query(query: str) -> dict:
+    """Use Chat LLM to extract metadata filters from a natural language query."""
+    try:
+        prompt = FILTER_EXTRACT_PROMPT.replace("{query}", query)
+        raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.0)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        return json.loads(cleaned)
+    except Exception as e:
+        log.warning(f"Filter extraction failed: {e}")
+        return {}
 
 # ===========================================================================
 # IMPROVEMENT 2: Markdown-Aware Structural Chunking
@@ -294,6 +371,32 @@ def _search(client, collection, vector, limit, filt=None):
         resp = client.query_points(**kw)
         return resp.points if hasattr(resp, "points") else resp
     raise AttributeError("No supported search method")
+
+
+def build_qdrant_filter(filters: dict) -> Optional[Filter]:
+    """Convert a user-friendly filters dict into a Qdrant Filter object."""
+    if not filters:
+        return None
+    must = []
+    if filters.get("doc_type"):
+        must.append(FieldCondition(key="metadata.doc_type", match=MatchValue(value=filters["doc_type"])))
+    for tag in (filters.get("tags") or []):
+        must.append(FieldCondition(key="metadata.tags", match=MatchValue(value=tag)))
+    for party in (filters.get("parties") or []):
+        must.append(FieldCondition(key="metadata.parties", match=MatchValue(value=party)))
+    if filters.get("filename"):
+        must.append(FieldCondition(key="filename", match=MatchValue(value=filters["filename"])))
+    # Date filtering: stored as string YYYY-MM-DD, use range on metadata.date
+    if filters.get("date_from") or filters.get("date_to"):
+        from qdrant_client.http.models import Range
+        range_kw = {}
+        if filters.get("date_from"):
+            range_kw["gte"] = filters["date_from"]
+        if filters.get("date_to"):
+            range_kw["lte"] = filters["date_to"]
+        if range_kw:
+            must.append(FieldCondition(key="metadata.date", range=Range(**range_kw)))
+    return Filter(must=must) if must else None
 
 # ===========================================================================
 # IMPROVEMENT 1: Conversational Memory
@@ -479,6 +582,100 @@ async def health_check():
     return health
 
 
+# --- Auto-Tag & Metadata ---
+
+@app.post("/v1/autotag", tags=["Metadata"])
+async def autotag_endpoint(
+    api_key: str = Depends(verify_api_key),
+    markdown_content: str = Body(..., embed=True),
+):
+    """Auto-generate metadata tags from document text using LLM."""
+    try:
+        metadata = autotag_document(markdown_content)
+        return {"status": "ok", "metadata": metadata}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/metadata/{collection}/{filename}", tags=["Metadata"])
+async def get_metadata(collection: str, filename: str, api_key: str = Depends(verify_api_key)):
+    """Get metadata for all chunks of a document."""
+    try:
+        client = _qclient()
+        filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=filename))])
+        points, _ = client.scroll(collection_name=collection, scroll_filter=filt,
+                                  limit=1, with_payload=True)
+        if not points:
+            raise HTTPException(status_code=404, detail=f"No chunks found for '{filename}'")
+        p = points[0].payload or {}
+        return {
+            "filename": filename, "collection": collection,
+            "metadata": p.get("metadata", {}),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/v1/metadata/{collection}/{filename}", tags=["Metadata"])
+async def update_metadata(
+    collection: str, filename: str,
+    api_key: str = Depends(verify_api_key),
+    metadata: dict = Body(..., embed=True),
+):
+    """Update metadata on all chunks of a document WITHOUT re-embedding."""
+    try:
+        client = _qclient()
+        filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=filename))])
+        # Count affected points
+        points, _ = client.scroll(collection_name=collection, scroll_filter=filt,
+                                  limit=1000, with_payload=False)
+        if not points:
+            raise HTTPException(status_code=404, detail=f"No chunks found for '{filename}'")
+        # Update payload on all matching points — vectors untouched
+        client.set_payload(
+            collection_name=collection,
+            payload={"metadata": metadata},
+            points=filt,
+        )
+        log.info(f"Metadata updated: {filename} | {len(points)} chunks | {collection}")
+        return {"status": "ok", "filename": filename, "chunks_updated": len(points),
+                "metadata": metadata}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/documents/{collection}", tags=["Metadata"])
+async def list_documents(collection: str, api_key: str = Depends(verify_api_key)):
+    """List all unique documents in a collection with their metadata."""
+    try:
+        client = _qclient()
+        existing = {c.name for c in client.get_collections().collections}
+        if collection not in existing:
+            return {"documents": [], "count": 0}
+        points, _ = client.scroll(collection_name=collection, limit=5000, with_payload=True)
+        docs = {}
+        for pt in points:
+            p = pt.payload or {}
+            fn = p.get("filename", "unknown")
+            if fn not in docs:
+                docs[fn] = {
+                    "filename": fn,
+                    "metadata": p.get("metadata", {}),
+                    "chunks": 0,
+                    "created_at": p.get("created_at", 0),
+                }
+            docs[fn]["chunks"] += 1
+        return {"documents": list(docs.values()), "count": len(docs)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Ingest ---
+
 @app.post("/v1/ingest", tags=["RAG"])
 async def ingest_document(
     api_key: str = Depends(verify_api_key),
@@ -486,10 +683,12 @@ async def ingest_document(
     markdown_content: str = Body(..., embed=True),
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
+    metadata: dict = Body(None, embed=True),
 ):
-    """Ingest markdown using structural chunking: section-aware, tables intact."""
+    """Ingest markdown with metadata. Structural chunking, tables intact."""
     collection = collection or QDRANT_COLLECTION
     chunk_size = chunk_size or RAG_CHUNK_SIZE
+    metadata = metadata or {}
     try:
         structured_chunks = chunk_markdown_structural(markdown_content, chunk_size)
         if not structured_chunks:
@@ -514,10 +713,20 @@ async def ingest_document(
                 "section": chunk_meta["section"],
                 "content_type": chunk_meta["content_type"],
                 "created_at": now,
+                "metadata": metadata,
             }
             points.append(PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload))
 
         client.upsert(collection_name=collection, points=points)
+
+        # Create payload indexes for filtered search (idempotent)
+        try:
+            from qdrant_client.http.models import PayloadSchemaType
+            for field in ["metadata.doc_type", "metadata.tags", "metadata.date", "filename"]:
+                client.create_payload_index(collection_name=collection, field_name=field,
+                                            field_schema=PayloadSchemaType.KEYWORD)
+        except Exception:
+            pass  # Indexes may already exist
 
         db = API_KEY_DB[api_key]
         db["metrics"]["total_ingestions"] += 1
@@ -532,8 +741,9 @@ async def ingest_document(
         for c in structured_chunks:
             sections_summary[c["section"]] = sections_summary.get(c["section"], 0) + 1
 
-        log.info(f"Ingested: {filename} | {len(points)} chunks | sections: {sections_summary}")
-        return {"status": "ok", "chunks": len(points), "collection": collection, "sections": sections_summary}
+        log.info(f"Ingested: {filename} | {len(points)} chunks | meta: {metadata.get('doc_type', 'none')}")
+        return {"status": "ok", "chunks": len(points), "collection": collection,
+                "sections": sections_summary, "metadata": metadata}
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
@@ -549,19 +759,40 @@ async def chat_with_documents(
     session_id: str = Body(None, embed=True),
     memory_enabled: bool = Body(True, embed=True),
     memory_top_k: int = Body(None, embed=True),
+    filters: dict = Body(None, embed=True),
+    auto_extract_filters: bool = Body(False, embed=True),
 ):
-    """Memory-augmented RAG chat. Provide session_id for conversational memory."""
+    """Memory-augmented RAG chat with metadata filtering."""
     collection = collection or QDRANT_COLLECTION
     top_k = top_k or RAG_TOP_K
     memory_top_k = memory_top_k or MEMORY_TOP_K
     use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
 
     try:
+        # --- Auto-extract filters from query if enabled ---
+        active_filters = filters or {}
+        extracted_filters = {}
+        if auto_extract_filters and not filters:
+            try:
+                extracted_filters = extract_filters_from_query(query)
+                active_filters = extracted_filters
+                if extracted_filters:
+                    log.info(f"Auto-extracted filters: {extracted_filters}")
+            except Exception as e:
+                log.warning(f"Filter extraction skipped: {e}")
+
+        qdrant_filter = build_qdrant_filter(active_filters)
         query_vector = embed_single(query)
         client = _qclient()
 
-        # --- Document retrieval ---
-        doc_results = _search(client, collection, query_vector, top_k)
+        # --- Document retrieval (with filters + fallback) ---
+        doc_results = _search(client, collection, query_vector, top_k, filt=qdrant_filter)
+
+        # Fallback: if filters returned nothing, retry without filters
+        if not doc_results and qdrant_filter:
+            log.info("Filtered search returned 0 results — retrying without filters")
+            doc_results = _search(client, collection, query_vector, top_k)
+
         sources = []
         for pt in doc_results:
             p = pt.payload or {}
@@ -598,9 +829,13 @@ async def chat_with_documents(
         context = "\n\n".join(context_parts)
 
         sys_text = system_prompt or (
-            "You are a local RAG assistant. Answer using only the provided context. "
-            "Use conversation history for follow-up context when available. "
-            "If the answer is not in the context, say you do not know."
+            "You are a helpful RAG assistant with access to document context. "
+            "Use the provided context to answer questions accurately. "
+            "If conversation history is available, use it for follow-up context. "
+            "Cite sources when referencing specific documents. "
+            "For basic or general questions, answer naturally. "
+            "If the question requires document-specific information that is not in the context, "
+            "let the user know the information was not found in the available documents."
         )
         user_text = (
             "Answer the question using the context below. Cite sources when possible.\n\n"
