@@ -17,7 +17,7 @@ Endpoints:
   GET    /healthz              — Health check
 """
 
-import os, re, time, uuid, logging, math, json
+import os, re, time, uuid, logging, math, json, threading
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -51,7 +51,7 @@ QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "ocr_rag")
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chat_memory")
 
 RAG_CHUNK_SIZE    = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
-RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "30"))
+RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
 MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "5"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
@@ -808,7 +808,8 @@ async def chat_with_documents(
         if use_memory:
             memories = search_memory(client, session_id, query_vector, memory_top_k)
 
-        # --- Build context ---
+        # --- Build context (with smart truncation) ---
+        MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 1024  # reserve for response
         context_parts = []
 
         if memories:
@@ -826,7 +827,30 @@ async def chat_with_documents(
         if not sources and not memories:
             return {"answer": "No relevant information found.", "sources": [], "memories": []}
 
+        # Estimate tokens (~4 chars per token) and truncate if needed
         context = "\n\n".join(context_parts)
+        est_tokens = len(context) // 4 + len(query) // 4 + 200  # +200 for system prompt
+        while est_tokens > MAX_CONTEXT_TOKENS and sources:
+            # Drop the lowest-scored source and rebuild
+            sources.pop()
+            context_parts = []
+            if memories:
+                context_parts.append("=== CONVERSATION HISTORY ===")
+                for m in memories:
+                    context_parts.append(f"[Previous Q&A | relevance {m['score']:.4f}]")
+                    context_parts.append(f"Q: {m['query']}\nA: {m['answer']}")
+            if sources:
+                context_parts.append("\n=== DOCUMENT CONTEXT ===")
+                for s in sources:
+                    header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
+                    context_parts.append(f"{header}\n{s['text']}")
+            context = "\n\n".join(context_parts)
+            est_tokens = len(context) // 4 + len(query) // 4 + 200
+        if est_tokens > MAX_CONTEXT_TOKENS:
+            # Last resort: hard truncate the context string
+            max_chars = (MAX_CONTEXT_TOKENS - 200) * 4
+            context = context[:max_chars]
+            log.warning(f"Context hard-truncated to {max_chars} chars")
 
         sys_text = system_prompt or (
             "You are a helpful RAG assistant with access to document context. "
@@ -843,12 +867,18 @@ async def chat_with_documents(
         )
         answer = chat_completion([{"role": "system", "content": sys_text}, {"role": "user", "content": user_text}])
 
-        # --- Store memory ---
+        # --- Store memory (async — don't block response) ---
         if use_memory:
-            qa_text = f"Q: {query}\nA: {answer}"
-            qa_vector = embed_single(qa_text)
-            store_memory(client, session_id, query, answer, qa_vector)
-            log.info(f"Memory stored for session {session_id[:8]}...")
+            _sid, _q, _a = session_id, query, answer
+            def _store_memory_bg():
+                try:
+                    qa_vector = embed_single(f"Q: {_q}\nA: {_a}")
+                    c = _qclient()
+                    store_memory(c, _sid, _q, _a, qa_vector)
+                    log.info(f"Memory stored (async) for session {_sid[:8]}...")
+                except Exception as e:
+                    log.warning(f"Async memory storage failed: {e}")
+            threading.Thread(target=_store_memory_bg, daemon=True).start()
 
         # --- Metrics ---
         db = API_KEY_DB[api_key]

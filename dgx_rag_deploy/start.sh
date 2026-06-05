@@ -97,6 +97,9 @@ wait_for_server() {
     return 1
 }
 
+# Create logs dir
+mkdir -p "$SCRIPT_DIR/logs"
+
 # --- 1. Qdrant ---
 echo -e "${CYAN}[1/4]${NC} Starting Qdrant..."
 if docker ps --format '{{.Names}}' | grep -q '^qdrant$'; then
@@ -118,8 +121,10 @@ echo -e "${CYAN}[2/4]${NC} Starting Embedding model on :${EMBED_PORT}..."
     -ngl "$GPU_LAYERS" \
     --ctx-size "$EMBED_CTX_SIZE" \
     --embeddings \
+    -b 2048 \
+    --threads 10 \
     --api-key "$EMBED_API_KEY" \
-    > /dev/null 2>&1 &
+    > "$SCRIPT_DIR/logs/embed.log" 2>&1 &
 echo $! >> "$PID_FILE"
 wait_for_server "Embeddings" "$EMBED_PORT" 120
 
@@ -131,8 +136,13 @@ echo -e "${CYAN}[3/4]${NC} Starting Chat LLM on :${CHAT_PORT}..."
     --port "$CHAT_PORT" \
     -ngl "$GPU_LAYERS" \
     --ctx-size "$CHAT_CTX_SIZE" \
+    --flash-attn on \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
+    -b 2048 \
+    --threads 10 \
     --api-key "$CHAT_API_KEY" \
-    > /dev/null 2>&1 &
+    > "$SCRIPT_DIR/logs/chat.log" 2>&1 &
 echo $! >> "$PID_FILE"
 wait_for_server "Chat LLM" "$CHAT_PORT" 180
 
