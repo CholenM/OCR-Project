@@ -271,13 +271,18 @@ with tab_chat:
         c1.link_button("🔗 Qdrant Dashboard", QDRANT_DASHBOARD, use_container_width=True)
         c2.link_button("🔗 Swagger UI", f"{rag_url}/docs", use_container_width=True)
         st.markdown("---")
+        st.markdown("**🧠 Retrieval Engine**")
+        re1, re2, re3 = st.columns(3)
+        with re1: rerank_enabled = st.checkbox("Re-ranking (LLM)", value=True, help="LLM re-scores chunks for precision")
+        with re2: agentic_enabled = st.checkbox("Agentic RAG", value=True, help="Query decomposition for complex questions")
+        with re3: auto_extract = st.checkbox("Auto-extract filters", value=False)
+        st.markdown("---")
         cl, cr = st.columns(2)
         with cl:
             chat_top_k = st.number_input("Top K", 1, 50, 15, 1)
             memory_enabled = st.checkbox("Memory", value=True)
             memory_top_k = st.number_input("Memory Top K", 1, 20, 5, 1)
         with cr:
-            auto_extract = st.checkbox("Auto-extract filters from query", value=False)
             system_prompt = st.text_area("System Prompt",
                 value="You are a helpful RAG assistant. Use the provided context to answer accurately. "
                       "For basic questions, answer naturally. Cite sources when referencing documents.", height=80)
@@ -294,8 +299,8 @@ with tab_chat:
         if f_date_from: manual_filters["date_from"] = f_date_from
         if f_date_to: manual_filters["date_to"] = f_date_to
     if "chat_top_k" not in dir():
-        chat_top_k, memory_enabled, memory_top_k, system_prompt = 30, True, 5, None
-        auto_extract, manual_filters = False, {}
+        chat_top_k, memory_enabled, memory_top_k, system_prompt = 15, True, 5, None
+        auto_extract, manual_filters, rerank_enabled, agentic_enabled = False, {}, True, True
     if st.button("Clear Chat & Memory"):
         if api_key_input and active:
             try: requests.delete(f"{rag_url}/v1/memory/{active}", headers=_h(), timeout=5)
@@ -321,10 +326,11 @@ with tab_chat:
             try:
                 payload = {"query": prompt, "collection": active, "top_k": int(chat_top_k),
                            "session_id": active, "memory_enabled": memory_enabled,
-                           "memory_top_k": int(memory_top_k), "auto_extract_filters": auto_extract}
+                           "memory_top_k": int(memory_top_k), "auto_extract_filters": auto_extract,
+                           "rerank": rerank_enabled, "agentic": agentic_enabled}
                 if manual_filters: payload["filters"] = manual_filters
                 if system_prompt: payload["system_prompt"] = system_prompt
-                r = requests.post(f"{rag_url}/v1/chat", headers=_h(), json=payload, timeout=180)
+                r = requests.post(f"{rag_url}/v1/chat", headers=_h(), json=payload, timeout=300)
                 if r.status_code == 200:
                     res = r.json()
                     answer, sources, memories = res["answer"], res.get("sources",[]), res.get("memories",[])

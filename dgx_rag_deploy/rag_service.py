@@ -20,6 +20,7 @@ Endpoints:
 import os, re, time, uuid, logging, math, json, threading
 from datetime import datetime
 from typing import Dict, List, Optional
+from collections import Counter
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status, Header, Body
@@ -28,6 +29,7 @@ import requests
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
     Distance, PointStruct, VectorParams, Filter, FieldCondition, MatchValue,
+    SparseVectorParams, SparseVector, Modifier,
 )
 
 load_dotenv()
@@ -351,26 +353,77 @@ def chunk_markdown_structural(text: str, max_chunk_size: int = None) -> List[Dic
 def _qclient() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL)
 
+def _tokenize_bm25(text: str) -> SparseVector:
+    """Convert text to sparse vector for BM25 keyword matching."""
+    words = re.findall(r'\b[a-zA-Z0-9]{2,}\b', text.lower())
+    counts = Counter(words)
+    indices, values = [], []
+    for word, count in counts.items():
+        indices.append(abs(hash(word)) % (2**30))
+        values.append(float(count))
+    return SparseVector(indices=indices, values=values)
+
 def ensure_collection(client, name, vector_size):
+    """Create collection with named dense + sparse (BM25) vectors."""
     existing = {c.name for c in client.get_collections().collections}
     if name not in existing:
-        client.create_collection(collection_name=name,
-                                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE))
+        client.create_collection(
+            collection_name=name,
+            vectors_config={"dense": VectorParams(size=vector_size, distance=Distance.COSINE)},
+            sparse_vectors_config={"bm25": SparseVectorParams(modifier=Modifier.IDF)},
+        )
+        log.info(f"Created hybrid collection: {name} (dense={vector_size}, sparse=BM25)")
 
-def _search(client, collection, vector, limit, filt=None):
-    """Search Qdrant, compatible with multiple client versions."""
+def _is_hybrid_collection(client, collection) -> bool:
+    """Check if collection has named vectors (hybrid) or legacy unnamed."""
+    try:
+        info = client.get_collection(collection)
+        cfg = info.config.params.vectors
+        return isinstance(cfg, dict) and "dense" in cfg
+    except Exception:
+        return False
+
+def _search(client, collection, vector, limit, filt=None, query_text=""):
+    """Hybrid search: dense + BM25 with RRF fusion. Falls back to dense-only for legacy collections."""
+    hybrid = _is_hybrid_collection(client, collection)
+    if hybrid and query_text:
+        return _hybrid_search(client, collection, vector, query_text, limit, filt)
+    return _dense_search(client, collection, vector, limit, filt, hybrid)
+
+def _dense_search(client, collection, vector, limit, filt=None, named=False):
+    """Dense-only vector search."""
+    qv = ("dense", vector) if named else vector
     if hasattr(client, "search"):
-        kw = {"collection_name": collection, "query_vector": vector, "limit": limit, "with_payload": True}
-        if filt:
-            kw["query_filter"] = filt
+        kw = {"collection_name": collection, "query_vector": qv, "limit": limit, "with_payload": True}
+        if filt: kw["query_filter"] = filt
         return client.search(**kw)
     if hasattr(client, "query_points"):
-        kw = {"collection_name": collection, "query": vector, "limit": limit, "with_payload": True}
-        if filt:
-            kw["query_filter"] = filt
+        kw = {"collection_name": collection, "query": qv, "limit": limit, "with_payload": True}
+        if filt: kw["query_filter"] = filt
         resp = client.query_points(**kw)
         return resp.points if hasattr(resp, "points") else resp
     raise AttributeError("No supported search method")
+
+def _hybrid_search(client, collection, dense_vector, query_text, limit, filt=None):
+    """BM25 + Dense hybrid search with Reciprocal Rank Fusion."""
+    try:
+        from qdrant_client.http.models import Prefetch, FusionQuery, Fusion
+        sparse_vec = _tokenize_bm25(query_text)
+        prefetch_kw = [{"query": dense_vector, "using": "dense", "limit": limit * 2},
+                       {"query": sparse_vec, "using": "bm25", "limit": limit * 2}]
+        if filt:
+            prefetch_kw = [{**p, "filter": filt} for p in prefetch_kw]
+        prefetches = [Prefetch(**p) for p in prefetch_kw]
+        resp = client.query_points(
+            collection_name=collection, prefetch=prefetches,
+            query=FusionQuery(fusion=Fusion.RRF), limit=limit, with_payload=True,
+        )
+        pts = resp.points if hasattr(resp, "points") else resp
+        log.info(f"Hybrid search: {len(pts)} results (dense+BM25 RRF)")
+        return pts
+    except Exception as e:
+        log.warning(f"Hybrid search failed, falling back to dense: {e}")
+        return _dense_search(client, collection, dense_vector, limit, filt, named=True)
 
 
 def build_qdrant_filter(filters: dict) -> Optional[Filter]:
@@ -715,7 +768,12 @@ async def ingest_document(
                 "created_at": now,
                 "metadata": metadata,
             }
-            points.append(PointStruct(id=str(uuid.uuid4()), vector=vector, payload=payload))
+            sparse = _tokenize_bm25(chunk_meta["text"])
+            points.append(PointStruct(
+                id=str(uuid.uuid4()),
+                vector={"dense": vector, "bm25": sparse},
+                payload=payload,
+            ))
 
         client.upsert(collection_name=collection, points=points)
 
@@ -748,6 +806,78 @@ async def ingest_document(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
+# ===========================================================================
+# Phase 2: LLM Re-ranking
+# ===========================================================================
+
+RERANK_PROMPT = """Score each chunk's relevance to the query (0-10). Return ONLY a JSON array of integers.
+Query: {query}
+{chunks}
+Scores:"""
+
+def rerank_chunks(query: str, sources: list, min_score: int = 4) -> list:
+    """Use Chat LLM to re-score and filter retrieved chunks."""
+    if not sources or len(sources) <= 3:
+        return sources
+    try:
+        chunk_text = "\n".join(f"[{i}] {s['text'][:300]}" for i, s in enumerate(sources))
+        prompt = RERANK_PROMPT.replace("{query}", query).replace("{chunks}", chunk_text)
+        raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.0)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        scores = json.loads(cleaned)
+        if not isinstance(scores, list) or len(scores) != len(sources):
+            return sources
+        for i, s in enumerate(sources):
+            s["rerank_score"] = scores[i] if i < len(scores) else 5
+        reranked = [s for s in sources if s.get("rerank_score", 5) >= min_score]
+        reranked.sort(key=lambda x: x.get("rerank_score", 0), reverse=True)
+        log.info(f"Reranked: {len(sources)} -> {len(reranked)} chunks (min_score={min_score})")
+        return reranked if reranked else sources[:5]
+    except Exception as e:
+        log.warning(f"Rerank failed: {e}")
+        return sources
+
+# ===========================================================================
+# Phase 3: Agentic Query Planning
+# ===========================================================================
+
+PLAN_PROMPT = """Analyze this query and determine the best retrieval strategy.
+Return ONLY a valid JSON object:
+{
+  "strategy": "simple" or "decompose",
+  "sub_queries": ["query1", "query2"],
+  "reasoning": "brief explanation"
+}
+
+Rules:
+- "simple": Direct search. Use for factual, single-source questions.
+- "decompose": Break into 2-4 sub-queries. Use for multi-faceted questions, table-building, or comparison queries.
+- For "simple", sub_queries should contain just the original query.
+- Sub-queries should be specific and self-contained.
+
+Query: {query}"""
+
+def plan_query(query: str) -> dict:
+    """Use LLM to plan retrieval strategy for complex queries."""
+    try:
+        prompt = PLAN_PROMPT.replace("{query}", query)
+        raw = chat_completion([{"role": "user", "content": prompt}], temperature=0.0)
+        cleaned = raw.strip()
+        if cleaned.startswith("```"):
+            cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
+        plan = json.loads(cleaned)
+        if "sub_queries" not in plan:
+            plan["sub_queries"] = [query]
+        if "strategy" not in plan:
+            plan["strategy"] = "simple"
+        log.info(f"Query plan: {plan['strategy']} | {len(plan['sub_queries'])} sub-queries")
+        return plan
+    except Exception as e:
+        log.warning(f"Query planning failed: {e}")
+        return {"strategy": "simple", "sub_queries": [query], "reasoning": "fallback"}
+
 
 @app.post("/v1/chat", tags=["RAG"])
 async def chat_with_documents(
@@ -761,55 +891,70 @@ async def chat_with_documents(
     memory_top_k: int = Body(None, embed=True),
     filters: dict = Body(None, embed=True),
     auto_extract_filters: bool = Body(False, embed=True),
+    rerank: bool = Body(True, embed=True),
+    agentic: bool = Body(True, embed=True),
 ):
-    """Memory-augmented RAG chat with metadata filtering."""
+    """Hybrid RAG chat with BM25, re-ranking, and agentic query planning."""
     collection = collection or QDRANT_COLLECTION
     top_k = top_k or RAG_TOP_K
     memory_top_k = memory_top_k or MEMORY_TOP_K
     use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
 
     try:
-        # --- Auto-extract filters from query if enabled ---
+        # --- Filters ---
         active_filters = filters or {}
-        extracted_filters = {}
         if auto_extract_filters and not filters:
             try:
-                extracted_filters = extract_filters_from_query(query)
-                active_filters = extracted_filters
-                if extracted_filters:
-                    log.info(f"Auto-extracted filters: {extracted_filters}")
-            except Exception as e:
-                log.warning(f"Filter extraction skipped: {e}")
-
+                active_filters = extract_filters_from_query(query)
+                if active_filters:
+                    log.info(f"Auto-extracted filters: {active_filters}")
+            except Exception:
+                pass
         qdrant_filter = build_qdrant_filter(active_filters)
-        query_vector = embed_single(query)
         client = _qclient()
 
-        # --- Document retrieval (with filters + fallback) ---
-        doc_results = _search(client, collection, query_vector, top_k, filt=qdrant_filter)
+        # --- Phase 3: Agentic query planning ---
+        if agentic:
+            plan = plan_query(query)
+            sub_queries = plan.get("sub_queries", [query])
+        else:
+            sub_queries = [query]
 
-        # Fallback: if filters returned nothing, retry without filters
-        if not doc_results and qdrant_filter:
-            log.info("Filtered search returned 0 results — retrying without filters")
-            doc_results = _search(client, collection, query_vector, top_k)
+        # --- Retrieve for each sub-query and merge ---
+        all_sources = {}
+        for sq in sub_queries:
+            sq_vector = embed_single(sq)
+            results = _search(client, collection, sq_vector, top_k, filt=qdrant_filter, query_text=sq)
+            if not results and qdrant_filter:
+                results = _search(client, collection, sq_vector, top_k, query_text=sq)
+            for pt in results:
+                p = pt.payload or {}
+                key = f"{p.get('filename','')}__{p.get('chunk_index',0)}"
+                if key not in all_sources:
+                    all_sources[key] = {
+                        "text": p.get("text", ""), "filename": p.get("filename", "unknown"),
+                        "chunk_index": p.get("chunk_index", 0), "section": p.get("section", ""),
+                        "content_type": p.get("content_type", ""), "score": pt.score,
+                        "type": "document",
+                    }
+                else:
+                    all_sources[key]["score"] = max(all_sources[key]["score"], pt.score)
 
-        sources = []
-        for pt in doc_results:
-            p = pt.payload or {}
-            sources.append({
-                "text": p.get("text", ""), "filename": p.get("filename", "unknown"),
-                "chunk_index": p.get("chunk_index", 0), "section": p.get("section", ""),
-                "content_type": p.get("content_type", ""), "score": pt.score,
-                "type": "document",
-            })
+        sources = sorted(all_sources.values(), key=lambda x: x["score"], reverse=True)
+
+        # --- Phase 2: Re-rank ---
+        if rerank and sources:
+            sources = rerank_chunks(query, sources)
 
         # --- Memory retrieval ---
+        query_vector = embed_single(query)
         memories = []
         if use_memory:
             memories = search_memory(client, session_id, query_vector, memory_top_k)
 
         # --- Build context (with smart truncation) ---
-        MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 1024  # reserve for response
+        # Qwen tokenizer: ~3 chars per token (conservative estimate)
+        MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 2048  # reserve for response
         context_parts = []
 
         if memories:
@@ -827,11 +972,11 @@ async def chat_with_documents(
         if not sources and not memories:
             return {"answer": "No relevant information found.", "sources": [], "memories": []}
 
-        # Estimate tokens (~4 chars per token) and truncate if needed
+        # Estimate tokens (~3 chars per token for Qwen) and truncate if needed
         context = "\n\n".join(context_parts)
-        est_tokens = len(context) // 4 + len(query) // 4 + 200  # +200 for system prompt
+        est_tokens = len(context) // 3 + len(query) // 3 + 300
+        original_sources = len(sources)
         while est_tokens > MAX_CONTEXT_TOKENS and sources:
-            # Drop the lowest-scored source and rebuild
             sources.pop()
             context_parts = []
             if memories:
@@ -845,10 +990,11 @@ async def chat_with_documents(
                     header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
                     context_parts.append(f"{header}\n{s['text']}")
             context = "\n\n".join(context_parts)
-            est_tokens = len(context) // 4 + len(query) // 4 + 200
+            est_tokens = len(context) // 3 + len(query) // 3 + 300
+        if original_sources != len(sources):
+            log.info(f"Context truncated: {original_sources} -> {len(sources)} sources ({est_tokens} est. tokens)")
         if est_tokens > MAX_CONTEXT_TOKENS:
-            # Last resort: hard truncate the context string
-            max_chars = (MAX_CONTEXT_TOKENS - 200) * 4
+            max_chars = (MAX_CONTEXT_TOKENS - 300) * 3
             context = context[:max_chars]
             log.warning(f"Context hard-truncated to {max_chars} chars")
 
