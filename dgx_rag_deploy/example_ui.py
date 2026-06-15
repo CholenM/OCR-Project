@@ -292,17 +292,21 @@ with tab_chat:
         c2.link_button("🔗 Swagger UI", f"{rag_url}/docs", use_container_width=True)
         st.markdown("---")
         st.markdown("**🧠 Retrieval Engine** — Toggle features that add LLM calls (slower but more precise)")
-        re1, re2, re3 = st.columns(3)
+        re1, re2, re3, re4, re5 = st.columns(5)
         with re1:
-            rerank_enabled = st.checkbox("Re-ranking", value=False, help="⚠️ +5-15s latency. LLM re-scores chunks.")
+            rerank_enabled = st.checkbox("Re-ranking", value=False, help="LLM re-scores chunks for precision.")
         with re2:
-            agentic_enabled = st.checkbox("Agentic RAG", value=False, help="⚠️ +3-8s latency. Decomposes complex queries.")
+            agentic_enabled = st.checkbox("Agentic RAG", value=False, help="Decomposes complex queries into sub-queries.")
         with re3:
-            auto_extract = st.checkbox("Auto-extract filters", value=False, help="⚠️ +3-8s latency. LLM extracts metadata filters.")
+            auto_extract = st.checkbox("Auto Filters", value=False, help="LLM extracts metadata filters from query.")
+        with re4:
+            hyde_enabled = st.checkbox("HyDE", value=False, help="Generates hypothetical answer for better embedding.")
+        with re5:
+            streaming_enabled = st.checkbox("Streaming", value=True, help="Stream tokens as they're generated.")
 
-        if rerank_enabled or agentic_enabled or auto_extract:
-            enabled = [x for x, v in [("Re-rank", rerank_enabled), ("Agentic", agentic_enabled), ("Auto-filter", auto_extract)] if v]
-            st.warning(f"⚡ **Slow mode**: {', '.join(enabled)} enabled. Each adds an LLM call (+3-15s).")
+        if rerank_enabled or agentic_enabled or auto_extract or hyde_enabled:
+            enabled = [x for x, v in [("Re-rank", rerank_enabled), ("Agentic", agentic_enabled), ("Auto-filter", auto_extract), ("HyDE", hyde_enabled)] if v]
+            st.warning(f"⚡ **Enhanced mode**: {', '.join(enabled)} enabled. Each adds an LLM call (+3-15s).")
 
         st.markdown("---")
         cl, cr = st.columns(2)
@@ -328,8 +332,9 @@ with tab_chat:
         if f_date_to: manual_filters["date_to"] = f_date_to
 
     if "chat_top_k" not in dir():
-        chat_top_k, memory_enabled, memory_top_k, system_prompt = 15, True, 5, None
+        chat_top_k, memory_enabled, memory_top_k, system_prompt = 15, True, 3, None
         auto_extract, manual_filters, rerank_enabled, agentic_enabled = False, {}, False, False
+        hyde_enabled, streaming_enabled = False, True
 
     if st.button("Clear Chat & Memory"):
         if api_key_input and active:
@@ -356,25 +361,128 @@ with tab_chat:
     prompt = st.chat_input("Ask about documents in this session")
     if prompt and active:
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
-        with st.spinner("Querying..."):
-            try:
-                payload = {"query": prompt, "collection": active, "top_k": int(chat_top_k),
-                           "session_id": active, "memory_enabled": memory_enabled,
-                           "memory_top_k": int(memory_top_k), "auto_extract_filters": auto_extract,
-                           "rerank": rerank_enabled, "agentic": agentic_enabled}
-                if manual_filters: payload["filters"] = manual_filters
-                if system_prompt: payload["system_prompt"] = system_prompt
-                r = requests.post(f"{rag_url}/v1/chat", headers=_h(), json=payload, timeout=300)
-                if r.status_code == 200:
-                    res = r.json()
-                    answer = res["answer"]
-                    sources = res.get("sources", [])
-                    memories = res.get("memories", [])
-                    latency = res.get("latency", None)
-                else: answer, sources, memories, latency = f"Error: {r.text}", [], [], None
-            except Exception as e: answer, sources, memories, latency = f"Failed: {e}", [], [], None
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            if streaming_enabled:
+                # --- Streaming mode ---
+                try:
+                    payload = {"query": prompt, "collection": active, "top_k": int(chat_top_k),
+                               "session_id": active, "memory_enabled": memory_enabled,
+                               "memory_top_k": int(memory_top_k),
+                               "rerank": rerank_enabled, "agentic": agentic_enabled,
+                               "hyde": hyde_enabled}
+                    if manual_filters: payload["filters"] = manual_filters
+                    if system_prompt: payload["system_prompt"] = system_prompt
+
+                    answer_placeholder = st.empty()
+                    status_placeholder = st.empty()
+                    full_answer = ""
+                    display_answer = ""
+                    sources = []
+                    memories = []
+                    latency = None
+                    in_think_block = False
+
+                    status_placeholder.caption("🔍 Searching documents...")
+
+                    resp = requests.post(f"{rag_url}/v1/chat/stream", headers=_h(), json=payload, stream=True, timeout=300)
+
+                    # Check HTTP status first
+                    if resp.status_code != 200:
+                        answer = f"Error ({resp.status_code}): {resp.text[:300]}"
+                        st.error(answer)
+                    else:
+                        for line in resp.iter_lines():
+                            if not line:
+                                continue
+                            line = line.decode("utf-8")
+                            if not line.startswith("data: "):
+                                continue
+                            try:
+                                data = json.loads(line[6:])
+                                evt = data.get("type", "")
+                                if evt == "sources":
+                                    sources = data.get("sources", [])
+                                    memories = data.get("memories", [])
+                                    status_placeholder.caption(f"📄 Found {len(sources)} sources, generating answer...")
+                                elif evt == "token":
+                                    token = data.get("content", "")
+                                    full_answer += token
+                                    # Strip <think>...</think> blocks from display
+                                    if "<think>" in token:
+                                        in_think_block = True
+                                    if in_think_block:
+                                        if "</think>" in token:
+                                            in_think_block = False
+                                        continue
+                                    display_answer += token
+                                    if display_answer.strip():
+                                        status_placeholder.empty()
+                                        answer_placeholder.markdown(display_answer + "▌")
+                                elif evt == "complete":
+                                    latency = data.get("latency")
+                                    if data.get("answer"):
+                                        display_answer = data["answer"]
+                                        full_answer = data["answer"]
+                                elif evt == "error":
+                                    display_answer = f"⚠️ Error: {data.get('error', 'Unknown')}"
+                            except json.JSONDecodeError:
+                                pass
+
+                        resp.close()
+                        status_placeholder.empty()
+
+                        # Clean up any remaining think blocks in display
+                        import re as _re
+                        clean = _re.sub(r'<think>.*?</think>', '', display_answer, flags=_re.DOTALL).strip()
+                        if clean:
+                            display_answer = clean
+
+                        # Handle empty response
+                        if not display_answer.strip():
+                            display_answer = "⚠️ The model returned an empty response. Try rephrasing your question or disabling streaming."
+
+                        answer_placeholder.markdown(display_answer)
+                        answer = display_answer
+                except Exception as e:
+                    answer, sources, memories, latency = f"Failed: {e}", [], [], None
+                    st.error(answer)
+            else:
+                # --- Non-streaming mode ---
+                with st.spinner("Querying..."):
+                    try:
+                        payload = {"query": prompt, "collection": active, "top_k": int(chat_top_k),
+                                   "session_id": active, "memory_enabled": memory_enabled,
+                                   "memory_top_k": int(memory_top_k), "auto_extract_filters": auto_extract,
+                                   "rerank": rerank_enabled, "agentic": agentic_enabled,
+                                   "hyde": hyde_enabled}
+                        if manual_filters: payload["filters"] = manual_filters
+                        if system_prompt: payload["system_prompt"] = system_prompt
+                        r = requests.post(f"{rag_url}/v1/chat", headers=_h(), json=payload, timeout=300)
+                        if r.status_code == 200:
+                            res = r.json()
+                            answer = res["answer"]
+                            sources = res.get("sources", [])
+                            memories = res.get("memories", [])
+                            latency = res.get("latency", None)
+                        else: answer, sources, memories, latency = f"Error: {r.text}", [], [], None
+                    except Exception as e: answer, sources, memories, latency = f"Failed: {e}", [], [], None
+                st.markdown(answer)
+
+            if latency:
+                st.caption(f"⏱️ {latency}s")
+            if sources:
+                with st.expander(f"📄 Sources ({len(sources)})"):
+                    for s in sources:
+                        st.markdown(f"- **{s['filename']}** | {s.get('section','')} | score {s['score']:.4f}")
+            if memories:
+                with st.expander(f"🧠 Memory ({len(memories)})"):
+                    for m in memories:
+                        st.markdown(f"- **Q:** {m['query'][:80]}...\n  **A:** {m['answer'][:120]}...")
+
         st.session_state.chat_messages.append({"role":"assistant","content":answer,"sources":sources,"memories":memories,"latency":latency})
-        st.rerun()
 
 # ========================================================================
 # DATA MANAGER

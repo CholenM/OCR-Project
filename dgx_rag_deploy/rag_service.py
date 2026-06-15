@@ -21,18 +21,21 @@ Endpoints:
   GET    /healthz              — Health check
 """
 
-import os, re, time, uuid, json, logging
+import os, re, time, uuid, json, logging, hashlib, asyncio
 from datetime import datetime
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, status, Header, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 import requests
+import httpx
 
 from modules.embedder import embed_batch, embed_single
 from modules.chunker import chunk_markdown_structural
-from modules.retriever import retrieve, rerank_chunks, plan_query, build_context
+from modules.retriever import retrieve, plan_query, build_context
+from modules.reranker import rerank_with_server, rerank_with_llm
 from modules.memory import (
     store_memory_async, search_memory, clear_session_memory, list_session_memory,
 )
@@ -64,10 +67,19 @@ MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chat_memory")
 
 RAG_CHUNK_SIZE    = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
 RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
-MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "5"))
+MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "3"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
-MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 4096
+MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 6144
+
+# Reranker config (optional — if RERANKER_URL is set, use dedicated server)
+RERANKER_URL      = os.getenv("RERANKER_URL", "")  # e.g. http://127.0.0.1:8004/v1/rerank
+RERANKER_MODEL    = os.getenv("RERANKER_MODEL", "Qwen3-VL-Reranker-8B")
+RERANKER_API_KEY  = os.getenv("RERANKER_API_KEY", "sk-rerank-layer4")
+
+# Response cache (TTL-based)
+CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
+_response_cache: Dict[str, dict] = {}
 
 # ---------------------------------------------------------------------------
 # API Key DB
@@ -121,6 +133,57 @@ def _chat(messages, temperature=0.7):
     if r.status_code != 200:
         raise RuntimeError(f"Chat failed: {r.status_code} {r.text[:200]}")
     return r.json()["choices"][0]["message"]["content"]
+
+
+def _cache_key(query: str, collection: str, top_k: int) -> str:
+    """Generate deterministic cache key."""
+    return hashlib.sha256(f"{query}|{collection}|{top_k}".encode()).hexdigest()[:16]
+
+
+def _cache_get(key: str) -> Optional[dict]:
+    """Get cached response if still valid."""
+    entry = _response_cache.get(key)
+    if entry and time.time() - entry["ts"] < CACHE_TTL:
+        log.info(f"Cache HIT: {key}")
+        return entry["data"]
+    if entry:
+        del _response_cache[key]
+    return None
+
+
+def _cache_set(key: str, data: dict):
+    """Store response in cache."""
+    # Evict old entries if cache grows too large
+    if len(_response_cache) > 200:
+        oldest = min(_response_cache, key=lambda k: _response_cache[k]["ts"])
+        del _response_cache[oldest]
+    _response_cache[key] = {"ts": time.time(), "data": data}
+
+
+def _hyde_expand(query: str) -> str:
+    """HyDE: Generate a hypothetical answer to improve embedding quality for short queries."""
+    if len(query.split()) > 12:
+        return query  # Skip for long queries
+    try:
+        prompt = (
+            f"Write a 2-3 sentence factual answer to this question as if you had the document in front of you. "
+            f"Be specific with names, dates, and details.\n\nQuestion: {query}"
+        )
+        hypothetical = _chat([{"role": "user", "content": prompt}], temperature=0.3)
+        expanded = f"{query}\n{hypothetical}"
+        log.info(f"HyDE expanded: '{query[:40]}...' → {len(expanded)} chars")
+        return expanded
+    except Exception as e:
+        log.warning(f"HyDE expansion failed: {e}")
+        return query
+
+
+def _do_rerank(query: str, sources: list) -> list:
+    """Rerank using dedicated server (fast) or LLM fallback (slow)."""
+    if RERANKER_URL:
+        return rerank_with_server(query, sources, RERANKER_URL, RERANKER_MODEL, RERANKER_API_KEY)
+    else:
+        return rerank_with_llm(query, sources, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY)
 
 # ===========================================================================
 # File Format Converters (DOCX, TXT, CSV → Markdown)
@@ -299,14 +362,44 @@ async def get_metadata(collection: str, filename: str, api_key: str = Depends(ve
 @app.patch("/v1/metadata/{collection}/{filename}", tags=["Metadata"])
 async def update_metadata(collection: str, filename: str, api_key: str = Depends(verify_api_key), metadata: dict = Body(..., embed=True)):
     client = _qclient()
-    from qdrant_client.http.models import Filter, FieldCondition, MatchValue
+    from qdrant_client.http.models import Filter, FieldCondition, MatchValue, PointVectors
     filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=filename))])
-    points, _ = client.scroll(collection_name=collection, scroll_filter=filt, limit=1000, with_payload=False)
+    points, _ = client.scroll(collection_name=collection, scroll_filter=filt, limit=1000, with_payload=True)
     if not points:
         raise HTTPException(status_code=404, detail=f"No chunks found for '{filename}'")
-    client.set_payload(collection_name=collection, payload={"metadata": metadata}, points=filt)
-    log.info(f"Metadata updated: {filename} | {len(points)} chunks | {collection}")
-    return {"status": "ok", "filename": filename, "chunks_updated": len(points), "metadata": metadata}
+
+    # Re-tokenize BM25 vectors with new metadata
+    meta_text = filename
+    if metadata.get("parties"):
+        meta_text += " " + " ".join(metadata["parties"])
+    if metadata.get("doc_type"):
+        meta_text += " " + metadata["doc_type"]
+    if metadata.get("summary"):
+        meta_text += " " + metadata["summary"]
+
+    update_vectors = []
+    update_payloads = []
+    for pt in points:
+        chunk_text = (pt.payload or {}).get("text", "")
+        new_bm25_text = meta_text + " " + chunk_text
+        new_sparse = tokenize_bm25(new_bm25_text)
+        update_vectors.append(PointVectors(id=pt.id, vector={"bm25": new_sparse}))
+        update_payloads.append(pt.id)
+
+    # Batch update BM25 vectors
+    if update_vectors:
+        client.update_vectors(collection_name=collection, points=update_vectors)
+
+    # Update metadata + bm25_source in payload
+    client.set_payload(
+        collection_name=collection,
+        payload={"metadata": metadata, "bm25_source": meta_text},
+        points=filt,
+    )
+
+    log.info(f"Metadata + BM25 updated: {filename} | {len(points)} chunks | {collection}")
+    return {"status": "ok", "filename": filename, "chunks_updated": len(points), "metadata": metadata,
+            "bm25_retokenized": True}
 
 @app.get("/v1/documents/{collection}", tags=["Metadata"])
 async def list_documents(collection: str, api_key: str = Depends(verify_api_key)):
@@ -328,7 +421,7 @@ async def list_documents(collection: str, api_key: str = Depends(verify_api_key)
 # Endpoints: Ingest
 # ===========================================================================
 def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size: int, metadata: dict, api_key: str) -> dict:
-    """Core ingest logic used by both single and batch endpoints."""
+    """Core ingest logic. BM25 vectors include metadata for keyword searchability."""
     chunks = chunk_markdown_structural(markdown_content, chunk_size)
     if not chunks:
         return {"status": "empty", "chunks": 0, "collection": collection, "filename": filename}
@@ -344,11 +437,22 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
     # Dedup: remove old chunks for this filename
     delete_document_chunks(client, collection, filename)
 
+    # Build metadata text for BM25 enrichment
+    meta_text = filename
+    if metadata.get("parties"):
+        meta_text += " " + " ".join(metadata["parties"])
+    if metadata.get("doc_type"):
+        meta_text += " " + metadata["doc_type"]
+    if metadata.get("summary"):
+        meta_text += " " + metadata["summary"]
+
     now = int(time.time())
     from qdrant_client.http.models import PointStruct
     points = []
     for i, (chunk_meta, vector) in enumerate(zip(chunks, embeddings)):
-        sparse = tokenize_bm25(chunk_meta["text"])
+        # BM25 indexes metadata + content, dense indexes only content
+        bm25_text = meta_text + " " + chunk_meta["text"]
+        sparse = tokenize_bm25(bm25_text)
         points.append(PointStruct(
             id=str(uuid.uuid4()),
             vector={"dense": vector, "bm25": sparse},
@@ -356,7 +460,7 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
                 "source": "ocr", "filename": filename, "chunk_index": i,
                 "text": chunk_meta["text"], "section": chunk_meta["section"],
                 "content_type": chunk_meta["content_type"], "created_at": now,
-                "metadata": metadata,
+                "metadata": metadata, "bm25_source": meta_text,
             },
         ))
 
@@ -376,7 +480,7 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
     for c in chunks:
         sections_summary[c["section"]] = sections_summary.get(c["section"], 0) + 1
 
-    log.info(f"Ingested: {filename} | {len(points)} chunks | meta: {metadata.get('doc_type', 'none')}")
+    log.info(f"Ingested: {filename} | {len(points)} chunks | meta: {metadata.get('doc_type', 'none')} | bm25_enriched")
     return {"status": "ok", "chunks": len(points), "collection": collection,
             "filename": filename, "sections": sections_summary, "metadata": metadata}
 
@@ -420,21 +524,27 @@ async def ingest_batch(
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
 ):
-    """Batch ingest multiple documents. Each item: {filename, markdown_content, metadata?}."""
+    """Parallel batch ingest. Processes up to 4 documents concurrently."""
     collection = collection or QDRANT_COLLECTION
     chunk_size = chunk_size or RAG_CHUNK_SIZE
     results = []
-    for doc in documents:
-        fname = doc.get("filename", "unknown")
-        content = doc.get("markdown_content", "")
-        meta = doc.get("metadata", {})
-        try:
-            r = _do_ingest(fname, content, collection, chunk_size, meta, api_key)
-            results.append(r)
-        except Exception as e:
-            results.append({"status": "error", "filename": fname, "error": str(e)})
+    sem = asyncio.Semaphore(4)
+
+    async def ingest_one(doc):
+        async with sem:
+            fname = doc.get("filename", "unknown")
+            content = doc.get("markdown_content", "")
+            meta = doc.get("metadata", {})
+            try:
+                r = await asyncio.to_thread(_do_ingest, fname, content, collection, chunk_size, meta, api_key)
+                return r
+            except Exception as e:
+                return {"status": "error", "filename": fname, "error": str(e)}
+
+    tasks = [ingest_one(doc) for doc in documents]
+    results = await asyncio.gather(*tasks)
     total_chunks = sum(r.get("chunks", 0) for r in results)
-    return {"status": "ok", "documents": len(results), "total_chunks": total_chunks, "results": results}
+    return {"status": "ok", "documents": len(results), "total_chunks": total_chunks, "results": list(results)}
 
 # ===========================================================================
 # Endpoints: Chat (FAST by default)
@@ -453,15 +563,24 @@ async def chat_with_documents(
     auto_extract_filters: bool = Body(False, embed=True),
     rerank: bool = Body(False, embed=True),
     agentic: bool = Body(False, embed=True),
+    hyde: bool = Body(False, embed=True),
 ):
     """
     RAG chat. Fast by default (1 embed + 1 search + 1 answer).
-    Set rerank=true and/or agentic=true for enhanced (but slower) retrieval.
+    Set rerank=true, agentic=true, or hyde=true for enhanced retrieval.
     """
     collection = collection or QDRANT_COLLECTION
     top_k = top_k or RAG_TOP_K
     memory_top_k = memory_top_k or MEMORY_TOP_K
     use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
+
+    # Check cache (only for stateless queries without session)
+    cache_k = None
+    if not session_id:
+        cache_k = _cache_key(query, collection, top_k)
+        cached = _cache_get(cache_k)
+        if cached:
+            return cached
 
     try:
         t0 = time.time()
@@ -477,24 +596,27 @@ async def chat_with_documents(
             except Exception:
                 pass
 
+        # --- HyDE query expansion (OFF by default) ---
+        search_query = _hyde_expand(query) if hyde else query
+
         # --- Retrieve ---
         if agentic:
             query_vector, sources = plan_query(
-                query, client, collection,
+                search_query, client, collection,
                 EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
                 CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY,
                 top_k, active_filters,
             )
         else:
             query_vector, sources = retrieve(
-                query, client, collection,
+                search_query, client, collection,
                 EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
                 top_k, active_filters,
             )
 
         # --- Optional: re-rank (OFF by default) ---
         if rerank and sources:
-            sources = rerank_chunks(query, sources, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY)
+            sources = _do_rerank(query, sources)
 
         # --- Memory ---
         memories = []
@@ -508,13 +630,13 @@ async def chat_with_documents(
         context, sources = build_context(sources, memories, MAX_CONTEXT_TOKENS)
 
         sys_text = system_prompt or (
-            "You are a helpful RAG assistant with access to document context. "
-            "Use the provided context to answer questions accurately. "
-            "If conversation history is available, use it for follow-up context. "
-            "Cite sources when referencing specific documents. "
-            "For basic or general questions, answer naturally. "
-            "If the question requires document-specific information that is not in the context, "
-            "let the user know the information was not found in the available documents."
+            "You are a precise RAG assistant. Follow these rules strictly:\n"
+            "1. ALWAYS prioritize DOCUMENT CONTEXT over conversation history.\n"
+            "2. Conversation history is for follow-up context ONLY — never use it as a primary source of information.\n"
+            "3. If document context contains the answer, use that even if conversation history has similar info.\n"
+            "4. Cite specific document filenames when referencing information.\n"
+            "5. If the answer is not in the document context, say so clearly — do not fabricate.\n"
+            "6. For tables or lists, extract information ONLY from document context, not memory."
         )
         user_text = f"Answer the question using the context below. Cite sources when possible.\n\n{context}\n\nQuestion: {query}"
         answer = _chat([{"role": "system", "content": sys_text}, {"role": "user", "content": user_text}])
@@ -540,10 +662,163 @@ async def chat_with_documents(
             })
 
         log.info(f"Chat: '{query[:50]}...' | {len(sources)} docs | {len(memories)} mem | {latency}s")
-        return {"answer": answer, "sources": sources, "memories": memories, "latency": latency}
+        result = {"answer": answer, "sources": sources, "memories": memories, "latency": latency}
+
+        # Cache stateless responses
+        if cache_k:
+            _cache_set(cache_k, result)
+
+        return result
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Chat failed: {str(e)}")
+
+# ===========================================================================
+# Endpoints: Streaming Chat
+# ===========================================================================
+@app.post("/v1/chat/stream", tags=["RAG"])
+async def chat_stream(
+    api_key: str = Depends(verify_api_key),
+    query: str = Body(..., embed=True),
+    collection: str = Body(None, embed=True),
+    top_k: int = Body(None, embed=True),
+    system_prompt: str = Body(None, embed=True),
+    session_id: str = Body(None, embed=True),
+    memory_enabled: bool = Body(True, embed=True),
+    memory_top_k: int = Body(None, embed=True),
+    filters: dict = Body(None, embed=True),
+    rerank: bool = Body(False, embed=True),
+    agentic: bool = Body(False, embed=True),
+    hyde: bool = Body(False, embed=True),
+):
+    """Streaming RAG chat via SSE. First tokens appear in ~2-3s."""
+    collection = collection or QDRANT_COLLECTION
+    top_k = top_k or RAG_TOP_K
+    memory_top_k = memory_top_k or MEMORY_TOP_K
+    use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
+
+    async def generate():
+        try:
+            t0 = time.time()
+            client = _qclient()
+
+            # Retrieve
+            search_query = _hyde_expand(query) if hyde else query
+            if agentic:
+                query_vector, sources = plan_query(
+                    search_query, client, collection,
+                    EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
+                    CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY,
+                    top_k, filters or {},
+                )
+            else:
+                query_vector, sources = retrieve(
+                    search_query, client, collection,
+                    EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
+                    top_k, filters or {},
+                )
+
+            if rerank and sources:
+                sources = _do_rerank(query, sources)
+
+            memories = []
+            if use_memory:
+                memories = search_memory(client, MEMORY_COLLECTION, session_id, query_vector, memory_top_k)
+
+            if not sources and not memories:
+                yield f"data: {json.dumps({'type': 'complete', 'answer': 'No relevant information found.', 'sources': [], 'memories': [], 'latency': round(time.time() - t0, 2)})}\n\n"
+                return
+
+            context, sources = build_context(sources, memories, MAX_CONTEXT_TOKENS)
+
+            # Send sources metadata immediately
+            yield f"data: {json.dumps({'type': 'sources', 'sources': sources, 'memories': memories})}\n\n"
+
+            # Build messages
+            sys_text = system_prompt or (
+                "You are a precise RAG assistant. Follow these rules strictly:\n"
+                "1. ALWAYS prioritize DOCUMENT CONTEXT over conversation history.\n"
+                "2. Conversation history is for follow-up context ONLY.\n"
+                "3. Cite specific document filenames when referencing information.\n"
+                "4. If the answer is not in the document context, say so clearly.\n"
+                "5. For tables or lists, extract information ONLY from document context."
+            )
+            user_text = f"Answer the question using the context below. Cite sources when possible.\n\n{context}\n\nQuestion: {query}"
+
+            # Stream from LLM
+            full_answer = ""
+            clean_answer = ""  # Answer without <think> blocks
+            async with httpx.AsyncClient() as http_client:
+                async with http_client.stream(
+                    "POST", CHAT_MODEL_URL,
+                    json={"model": CHAT_MODEL_NAME, "messages": [
+                        {"role": "system", "content": sys_text},
+                        {"role": "user", "content": user_text},
+                    ], "temperature": 0.7, "stream": True},
+                    headers={"Authorization": f"Bearer {CHAT_API_KEY}"},
+                    timeout=300,
+                ) as resp:
+                    # Check if LLM returned an error
+                    if resp.status_code != 200:
+                        error_body = ""
+                        async for chunk in resp.aiter_bytes():
+                            error_body += chunk.decode("utf-8", errors="replace")
+                        log.error(f"LLM stream error {resp.status_code}: {error_body[:500]}")
+                        yield f"data: {json.dumps({'type': 'token', 'content': f'⚠️ LLM error ({resp.status_code}): {error_body[:200]}'})}\n\n"
+                        full_answer = f"LLM error: {error_body[:200]}"
+                    else:
+                        in_think = False
+                        async for line in resp.aiter_lines():
+                            if line.startswith("data: "):
+                                data = line[6:]
+                                if data.strip() == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data)
+                                    delta = chunk.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                                    if delta:
+                                        full_answer += delta
+                                        # Track <think> blocks — don't send to UI
+                                        if "<think>" in delta:
+                                            in_think = True
+                                        if in_think:
+                                            if "</think>" in delta:
+                                                in_think = False
+                                            continue
+                                        clean_answer += delta
+                                        yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
+                                except json.JSONDecodeError:
+                                    pass
+
+            # If we got think blocks but no visible content, extract clean answer
+            if not clean_answer.strip() and full_answer.strip():
+                import re as _re
+                stripped = _re.sub(r'<think>.*?</think>', '', full_answer, flags=_re.DOTALL).strip()
+                if stripped:
+                    clean_answer = stripped
+                    yield f"data: {json.dumps({'type': 'token', 'content': clean_answer})}\n\n"
+
+            # Guard against truly empty LLM responses
+            if not full_answer.strip():
+                log.warning(f"Stream produced empty answer for: '{query[:60]}...'")
+                full_answer = "The model returned an empty response. This may be due to context overflow or the model being busy. Try rephrasing your question."
+                yield f"data: {json.dumps({'type': 'token', 'content': full_answer})}\n\n"
+
+            # Store memory
+            if use_memory and full_answer:
+                store_memory_async(
+                    _qclient, MEMORY_COLLECTION, session_id, query, full_answer,
+                    lambda t: _embed(t),
+                )
+
+            latency = round(time.time() - t0, 2)
+            yield f"data: {json.dumps({'type': 'complete', 'latency': latency})}\n\n"
+            log.info(f"Stream: '{query[:50]}...' | {len(sources)} docs | {latency}s")
+
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 # ===========================================================================
 # Endpoints: Memory

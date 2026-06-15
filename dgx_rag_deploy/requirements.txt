@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 python-dotenv
-qdrant-client>=1.7.0
+qdrant-client>=1.12
 requests
 python-docx
+mmh3
+httpx

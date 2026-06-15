@@ -10,7 +10,7 @@ import os
 import re
 import json
 import logging
-from collections import Counter
+from collections import Counter, defaultdict
 from typing import List, Dict, Optional
 
 import requests
@@ -105,28 +105,29 @@ def _fetch_all_document_chunks(client, collection: str, filename: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Fix 1: Context Window Expansion
+# Context Expansion — Neighbor-Based (±3 chunks)
 # ---------------------------------------------------------------------------
 def _expand_document_context(
-    client, collection: str, sources: list, max_expansion: int = 5,
+    client, collection: str, sources: list,
+    neighbor_range: int = 3, max_expansion: int = 5,
 ) -> list:
     """
-    For high-signal documents (2+ chunks matched OR score > 0.7),
-    fetch ALL remaining chunks from those documents.
+    For high-signal documents, fetch neighboring chunks (±3 by chunk_index)
+    instead of dumping ALL chunks. Much more surgical.
     """
     if not sources:
         return sources
 
-    filename_counts = Counter(s["filename"] for s in sources)
-
-    # Documents with 2+ chunks in results = strong signal
-    expand_files = [f for f, c in filename_counts.items() if c >= 2]
-
-    # Also expand single-chunk docs with very high scores
+    # Group matched chunk_indices by filename
+    filename_chunks = defaultdict(set)
     for s in sources:
-        if s["score"] > 0.7 and s["filename"] not in expand_files:
-            expand_files.append(s["filename"])
+        filename_chunks[s["filename"]].add(s["chunk_index"])
 
+    # Decide which documents to expand
+    expand_files = [f for f, idxs in filename_chunks.items() if len(idxs) >= 2]
+    for s in sources:
+        if s["score"] > 0.55 and s["filename"] not in expand_files:
+            expand_files.append(s["filename"])
     expand_files = expand_files[:max_expansion]
 
     if not expand_files:
@@ -136,6 +137,19 @@ def _expand_document_context(
     expanded_count = 0
 
     for fname in expand_files:
+        matched_idxs = filename_chunks[fname]
+        # Compute neighbor indices needed
+        need_idxs = set()
+        for idx in matched_idxs:
+            for offset in range(-neighbor_range, neighbor_range + 1):
+                need_idxs.add(idx + offset)
+        need_idxs -= matched_idxs  # Don't re-fetch what we have
+        need_idxs = {i for i in need_idxs if i >= 0}  # No negative indices
+
+        if not need_idxs:
+            continue
+
+        # Fetch chunks for this document
         filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=fname))])
         points, _ = client.scroll(
             collection_name=collection, scroll_filter=filt,
@@ -143,22 +157,24 @@ def _expand_document_context(
         )
         for pt in points:
             p = pt.payload or {}
-            key = f"{p.get('filename', '')}__{p.get('chunk_index', 0)}"
-            if key not in existing_keys:
-                sources.append({
-                    "text": p.get("text", ""),
-                    "filename": p.get("filename", ""),
-                    "chunk_index": p.get("chunk_index", 0),
-                    "section": p.get("section", ""),
-                    "content_type": p.get("content_type", ""),
-                    "score": 0.5,  # Neutral score — kept unless truncation drops it
-                    "type": "expanded",
-                })
-                existing_keys.add(key)
-                expanded_count += 1
+            ci = p.get("chunk_index", -1)
+            if ci in need_idxs:
+                key = f"{p.get('filename', '')}__{ci}"
+                if key not in existing_keys:
+                    sources.append({
+                        "text": p.get("text", ""),
+                        "filename": p.get("filename", ""),
+                        "chunk_index": ci,
+                        "section": p.get("section", ""),
+                        "content_type": p.get("content_type", ""),
+                        "score": 0.5,
+                        "type": "neighbor",
+                    })
+                    existing_keys.add(key)
+                    expanded_count += 1
 
     if expanded_count:
-        log.info(f"Context expansion: +{expanded_count} chunks from {len(expand_files)} docs ({', '.join(expand_files[:3])}...)")
+        log.info(f"Neighbor expansion: +{expanded_count} chunks from {len(expand_files)} docs")
 
     return sources
 
@@ -178,9 +194,16 @@ def retrieve(
 ) -> tuple:
     """
     Fast retrieval: embed query → hybrid search → expand context → return.
-    Now includes document ID detection and context window expansion.
+    Includes document ID detection, neighbor expansion, and broad query boost.
     Returns (query_vector, sources_list).
     """
+    # 2C: Broad query auto-boost
+    _BROAD_PATTERNS = ["list all", "list down", "create a table", "show all",
+                       "how many", "every document", "all documents", "summarize all"]
+    if any(p in query.lower() for p in _BROAD_PATTERNS):
+        top_k = max(top_k, 30)
+        log.info(f"Broad query detected, boosted top_k to {top_k}")
+
     query_vector = embed_single(query, embed_url, embed_model, embed_api_key)
 
     # Fix 2: Check if query references a specific document
@@ -369,64 +392,84 @@ def plan_query(
 
 
 # ---------------------------------------------------------------------------
-# Context Assembly (smart truncation by score, not position)
+# Context Assembly — Memory-Capped, O(n) Greedy Selection
 # ---------------------------------------------------------------------------
 def build_context(
     sources: List[dict],
     memories: List[dict],
-    max_context_tokens: int = 30720,
+    max_context_tokens: int = 28672,
 ) -> tuple:
     """
-    Build context string from sources and memories.
-    Truncates by score (drops lowest-scoring sources first).
+    Build context string with document-first priority.
+    Memory gets max 20% of budget, documents get 80%.
+    Uses single-pass greedy selection (O(n) instead of O(n²)).
     Returns (context_string, final_sources).
     """
-    context_parts = []
+    CHARS_PER_TOKEN = 2.8  # Conservative for structured text with filenames/headers
+
+    # --- Memory section (capped at 20% of budget) ---
+    max_memory_tokens = max_context_tokens // 5
+    memory_parts = []
+    memory_tokens = 0
 
     if memories:
-        context_parts.append("=== CONVERSATION HISTORY ===")
+        memory_parts.append("=== CONVERSATION HISTORY (for follow-up context only) ===")
+        memory_tokens = int(len(memory_parts[0]) / CHARS_PER_TOKEN)
+        kept_memories = []
         for m in memories:
-            context_parts.append(f"[Previous Q&A | relevance {m['score']:.4f}]")
-            context_parts.append(f"Q: {m['query']}\nA: {m['answer']}")
+            entry = f"[Previous Q&A]\nQ: {m['query']}\nA: {m['answer']}"
+            entry_tokens = int(len(entry) / CHARS_PER_TOKEN)
+            if memory_tokens + entry_tokens <= max_memory_tokens:
+                memory_parts.append(entry)
+                memory_tokens += entry_tokens
+                kept_memories.append(m)
+            else:
+                break  # Memory is sorted by relevance, so stop
+        memories = kept_memories
 
-    # Sources are already sorted by score (highest first)
-    working_sources = list(sources)
+    if memory_tokens > 0:
+        log.info(f"Memory budget: {memory_tokens}/{max_memory_tokens} tokens ({len(memories)} memories)")
 
-    if working_sources:
-        context_parts.append("\n=== DOCUMENT CONTEXT ===")
-        for s in working_sources:
-            header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
-            context_parts.append(f"{header}\n{s['text']}")
+    # --- Document section (gets remaining 80%+) ---
+    remaining_budget = max_context_tokens - memory_tokens
 
-    context = "\n\n".join(context_parts)
-    # Conservative token estimate: ~2.5 chars/token for Qwen models
-    est_tokens = int(len(context) / 2.5)
+    # Pre-compute cost per source, sort by score descending
+    source_costs = []
+    for s in sources:
+        header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
+        text = f"{header}\n{s['text']}"
+        cost = int(len(text) / CHARS_PER_TOKEN)
+        source_costs.append((s, text, cost))
+    source_costs.sort(key=lambda x: x[0]["score"], reverse=True)
 
-    # Truncate by removing lowest-scoring sources
-    original_count = len(working_sources)
-    while est_tokens > max_context_tokens and working_sources:
-        working_sources.pop()  # Remove lowest-scored (last in sorted list)
-        context_parts = []
-        if memories:
-            context_parts.append("=== CONVERSATION HISTORY ===")
-            for m in memories:
-                context_parts.append(f"[Previous Q&A | relevance {m['score']:.4f}]")
-                context_parts.append(f"Q: {m['query']}\nA: {m['answer']}")
-        if working_sources:
-            context_parts.append("\n=== DOCUMENT CONTEXT ===")
-            for s in working_sources:
-                header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
-                context_parts.append(f"{header}\n{s['text']}")
-        context = "\n\n".join(context_parts)
-        est_tokens = int(len(context) / 2.5)
+    # Greedy fill: pick sources by score until budget exhausted
+    selected_sources = []
+    doc_parts = []
+    doc_tokens = 0
 
-    if original_count != len(working_sources):
-        log.info(f"Context truncated: {original_count} -> {len(working_sources)} sources ({est_tokens} est. tokens)")
+    for source, text, cost in source_costs:
+        if doc_tokens + cost <= remaining_budget:
+            selected_sources.append(source)
+            doc_parts.append(text)
+            doc_tokens += cost
 
-    # Hard truncation as last resort
-    if est_tokens > max_context_tokens:
-        max_chars = (max_context_tokens - 300) * 3
+    if len(selected_sources) < len(sources):
+        log.info(f"Context: {len(selected_sources)}/{len(sources)} sources fit ({doc_tokens} tokens, budget {remaining_budget})")
+
+    # --- Assemble final context ---
+    context_sections = []
+    if memory_parts:
+        context_sections.append("\n\n".join(memory_parts))
+    if doc_parts:
+        context_sections.append("=== DOCUMENT CONTEXT ===\n\n" + "\n\n".join(doc_parts))
+
+    context = "\n\n".join(context_sections)
+
+    # Hard truncation as absolute last resort
+    total_tokens = int(len(context) / CHARS_PER_TOKEN)
+    if total_tokens > max_context_tokens:
+        max_chars = int((max_context_tokens - 300) * CHARS_PER_TOKEN)
         context = context[:max_chars]
         log.warning(f"Context hard-truncated to {max_chars} chars")
 
-    return context, working_sources
+    return context, selected_sources

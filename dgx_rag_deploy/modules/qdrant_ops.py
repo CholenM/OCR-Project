@@ -10,6 +10,8 @@ import logging
 from collections import Counter
 from typing import List, Optional, Dict
 
+import mmh3
+
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
     Distance, PointStruct, VectorParams, Filter, FieldCondition, MatchValue,
@@ -90,7 +92,7 @@ def tokenize_bm25(text: str) -> SparseVector:
     indices = []
     values = []
     for word, count in counts.items():
-        indices.append(abs(hash(word)) % (2 ** 30))
+        indices.append(mmh3.hash(word, signed=False) % (2 ** 20))
         values.append(float(count))
     return SparseVector(indices=indices, values=values)
 
