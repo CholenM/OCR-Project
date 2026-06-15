@@ -1,8 +1,8 @@
 """
-OCR + RAG Control Center
+OCR + RAG Control Center v3
 Usage: streamlit run example_ui.py
 """
-import os, time, uuid, json
+import os, time, uuid, json, base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st, requests, pandas as pd
 
@@ -11,8 +11,8 @@ DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 QDRANT_DASHBOARD = os.getenv("QDRANT_DASHBOARD", "http://192.168.50.153:6333/dashboard")
 BATCH_SIZE = 3
 
-st.set_page_config(page_title="OCR + RAG Control Center", page_icon="", layout="wide")
-st.title("OCR + RAG Control Center")
+st.set_page_config(page_title="OCR + RAG Control Center v3", page_icon="", layout="wide")
+st.title("OCR + RAG Control Center v3")
 st.markdown("---")
 
 # --- Sidebar ---
@@ -27,7 +27,9 @@ if st.sidebar.button("Health Check"):
         try:
             r = requests.get(f"{url}/healthz", timeout=5)
             if r.status_code == 200:
-                st.sidebar.success(f"✅ {name}: {r.json()['status']}")
+                d = r.json()
+                ver = d.get("version", "")
+                st.sidebar.success(f"✅ {name}: {d['status']} {f'(v{ver})' if ver else ''}")
         except Exception as e:
             st.sidebar.error(f"{name}: {e}")
 
@@ -41,7 +43,6 @@ def load_sessions():
         return r.json().get("sessions", []) if r.status_code == 200 else []
     except: return []
 
-# Session state defaults
 for k, v in [("ocr_results", {}), ("ocr_metadata", {}), ("chat_messages", []),
              ("active_session", None), ("session_list", []),
              ("uploader_key", 0), ("ocr_step", 1)]:
@@ -109,7 +110,7 @@ DOC_TYPES = ["invoice","contract","report","letter","memo","receipt","policy","f
 tab_ocr, tab_chat, tab_data = st.tabs(["OCR Dashboard", "Chat Dashboard", "Data Manager"])
 
 # ========================================================================
-# OCR DASHBOARD — Step-based flow
+# OCR DASHBOARD
 # ========================================================================
 with tab_ocr:
     st.header("OCR Dashboard")
@@ -119,7 +120,6 @@ with tab_ocr:
         c2.link_button("🔗 Swagger UI", f"{rag_url}/docs", use_container_width=True)
 
     has_results = bool(st.session_state.ocr_results)
-    step = st.session_state.ocr_step
 
     # ── Step 1: Upload & OCR ──
     st.subheader(f"Step 1: Upload & Process {'✅' if has_results else ''}")
@@ -149,6 +149,7 @@ with tab_ocr:
                 with st.status(f"Processing {total} file(s)...", expanded=True) as sb:
                     t0 = time.time()
                     prog = st.progress(0, text=f"0 / {total}")
+                    elapsed_ph = st.empty()
                     done = 0
                     for batch_start in range(0, total, BATCH_SIZE):
                         batch = file_data[batch_start:batch_start+BATCH_SIZE]
@@ -160,10 +161,11 @@ with tab_ocr:
                                 nm = futs[f]; n,md,lat,tps,err = f.result()
                                 if err: slots[nm].markdown(f"❌ `{n}` — {err}")
                                 else:
-                                    slots[nm].markdown(f"✅ `{n}` — {lat:.1f}s")
+                                    slots[nm].markdown(f"✅ `{n}` — {lat:.1f}s | {tps:.0f} tok/s")
                                     results[n] = md
                                 done += 1
                                 prog.progress(done/total, text=f"{done}/{total}")
+                                elapsed_ph.caption(f"⏱️ Elapsed: {time.time()-t0:.1f}s")
                     if results:
                         st.write("🤖 **Auto-tagging...**")
                         for fname, md_text in results.items():
@@ -171,21 +173,33 @@ with tab_ocr:
                     sb.update(label=f"Done: {len(results)} files in {time.time()-t0:.1f}s ✅", state="complete")
 
                 if results:
-                    # REPLACE old results entirely (fix bug #2)
                     st.session_state.ocr_results = results
                     st.session_state.ocr_metadata = meta_results
                     st.session_state.ocr_step = 2
-                    # Increment uploader key to clear file widget (fix bug #1)
                     st.session_state.uploader_key += 1
                     st.rerun()
     else:
-        # Show summary of completed OCR
         rnames = list(st.session_state.ocr_results.keys())
         st.success(f"**{len(rnames)}** file(s) processed: {', '.join(rnames)}")
         col_dl, col_clr = st.columns(2)
-        combined = "".join(f"\n<!-- FILE: {n} -->\n{md}\n" for n,md in st.session_state.ocr_results.items())
-        col_dl.download_button("📥 Download Markdown", data=combined,
-            file_name=f"ocr_{int(time.time())}.md", mime="text/markdown", use_container_width=True)
+
+        # Individual downloads
+        for i, fname in enumerate(rnames):
+            base = os.path.splitext(fname)[0]
+            st.download_button(f"📄 {base}.md", data=st.session_state.ocr_results[fname],
+                file_name=f"{base}.md", mime="text/markdown", use_container_width=True, key=f"dl_{i}")
+
+        # Batch download
+        if len(rnames) > 1:
+            import io, zipfile
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, "w", zipfile.ZIP_DEFLATED) as zf:
+                for fname, md in st.session_state.ocr_results.items():
+                    zf.writestr(os.path.splitext(fname)[0] + ".md", md)
+            zbuf.seek(0)
+            col_dl.download_button("📦 Download All (ZIP)", data=zbuf.getvalue(),
+                file_name=f"ocr_batch_{int(time.time())}.zip", mime="application/zip", use_container_width=True)
+
         if col_clr.button("🔄 Start New OCR", use_container_width=True):
             st.session_state.ocr_results = {}
             st.session_state.ocr_metadata = {}
@@ -221,7 +235,6 @@ with tab_ocr:
                 st.session_state.ocr_metadata[edit_file] = updated
                 st.success(f"Saved for {edit_file}")
 
-        # Preview
         with st.expander("📄 Document Preview"):
             pf = st.selectbox("File", rnames, key="preview_sel")
             if pf:
@@ -238,24 +251,31 @@ with tab_ocr:
             st.warning("Create or select a session in the sidebar first.")
         else:
             rnames = list(st.session_state.ocr_results.keys())
-            st.info(f"**{len(rnames)}** file(s) → session **{target}**")
+            st.info(f"**{len(rnames)}** file(s) → session **{target}** (dedup enabled: re-ingest overwrites)")
             chunk_size = st.number_input("Chunk Size", 200, 4000, 1200, 50)
             if st.button("📤 Ingest to Vector Store", use_container_width=True, type="primary"):
                 total_chunks = 0; errors = []
-                with st.spinner(f"Ingesting {len(rnames)} file(s)... This may take a moment."):
-                    for fname in rnames:
+                with st.status(f"Ingesting {len(rnames)} file(s)...", expanded=True) as sb:
+                    t0 = time.time()
+                    for i, fname in enumerate(rnames):
                         meta = st.session_state.ocr_metadata.get(fname, {})
                         payload = {"filename": fname, "markdown_content": st.session_state.ocr_results[fname],
                                    "collection": target, "chunk_size": int(chunk_size), "metadata": meta}
+                        st.write(f"[{i+1}/{len(rnames)}] `{fname}`...")
                         try:
                             r = requests.post(f"{rag_url}/v1/ingest", headers=_h(), json=payload, timeout=120)
-                            if r.status_code == 200: total_chunks += r.json()["chunks"]
+                            if r.status_code == 200:
+                                c = r.json()["chunks"]
+                                total_chunks += c
+                                st.write(f"  ✅ {c} chunks")
                             else: errors.append(fname)
                         except: errors.append(fname)
+                    elapsed = time.time() - t0
+                    sb.update(label=f"Ingested {total_chunks} chunks in {elapsed:.1f}s", state="complete")
                 if errors:
                     st.error(f"Failed: {', '.join(errors)}")
                 else:
-                    st.success(f"✅ Ingested {total_chunks} chunks from {len(rnames)} file(s)")
+                    st.success(f"✅ {total_chunks} chunks from {len(rnames)} file(s) in {elapsed:.1f}s")
                 st.session_state.session_list = load_sessions()
 
 # ========================================================================
@@ -266,16 +286,24 @@ with tab_chat:
     active = st.session_state.active_session
     if active: st.caption(f"Session: **{active}**")
     else: st.warning("Select a session first.")
-    with st.expander("⚙️ Advanced Settings"):
+    with st.expander("⚙️ Retrieval Engine Settings"):
         c1, c2 = st.columns(2)
         c1.link_button("🔗 Qdrant Dashboard", QDRANT_DASHBOARD, use_container_width=True)
         c2.link_button("🔗 Swagger UI", f"{rag_url}/docs", use_container_width=True)
         st.markdown("---")
-        st.markdown("**🧠 Retrieval Engine**")
+        st.markdown("**🧠 Retrieval Engine** — Toggle features that add LLM calls (slower but more precise)")
         re1, re2, re3 = st.columns(3)
-        with re1: rerank_enabled = st.checkbox("Re-ranking (LLM)", value=True, help="LLM re-scores chunks for precision")
-        with re2: agentic_enabled = st.checkbox("Agentic RAG", value=True, help="Query decomposition for complex questions")
-        with re3: auto_extract = st.checkbox("Auto-extract filters", value=False)
+        with re1:
+            rerank_enabled = st.checkbox("Re-ranking", value=False, help="⚠️ +5-15s latency. LLM re-scores chunks.")
+        with re2:
+            agentic_enabled = st.checkbox("Agentic RAG", value=False, help="⚠️ +3-8s latency. Decomposes complex queries.")
+        with re3:
+            auto_extract = st.checkbox("Auto-extract filters", value=False, help="⚠️ +3-8s latency. LLM extracts metadata filters.")
+
+        if rerank_enabled or agentic_enabled or auto_extract:
+            enabled = [x for x, v in [("Re-rank", rerank_enabled), ("Agentic", agentic_enabled), ("Auto-filter", auto_extract)] if v]
+            st.warning(f"⚡ **Slow mode**: {', '.join(enabled)} enabled. Each adds an LLM call (+3-15s).")
+
         st.markdown("---")
         cl, cr = st.columns(2)
         with cl:
@@ -298,19 +326,24 @@ with tab_chat:
         if f_tags: manual_filters["tags"] = [t.strip() for t in f_tags.split(",") if t.strip()]
         if f_date_from: manual_filters["date_from"] = f_date_from
         if f_date_to: manual_filters["date_to"] = f_date_to
+
     if "chat_top_k" not in dir():
         chat_top_k, memory_enabled, memory_top_k, system_prompt = 15, True, 5, None
-        auto_extract, manual_filters, rerank_enabled, agentic_enabled = False, {}, True, True
+        auto_extract, manual_filters, rerank_enabled, agentic_enabled = False, {}, False, False
+
     if st.button("Clear Chat & Memory"):
         if api_key_input and active:
             try: requests.delete(f"{rag_url}/v1/memory/{active}", headers=_h(), timeout=5)
             except: pass
         st.session_state.chat_messages = []
         st.rerun()
+
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant":
+                lat = msg.get("latency")
+                if lat: st.caption(f"⏱️ {lat}s")
                 if msg.get("sources"):
                     with st.expander(f"📄 Sources ({len(msg['sources'])})"):
                         for s in msg["sources"]:
@@ -319,6 +352,7 @@ with tab_chat:
                     with st.expander(f"🧠 Memory ({len(msg['memories'])})"):
                         for m in msg["memories"]:
                             st.markdown(f"- **Q:** {m['query'][:80]}...\n  **A:** {m['answer'][:120]}...")
+
     prompt = st.chat_input("Ask about documents in this session")
     if prompt and active:
         st.session_state.chat_messages.append({"role": "user", "content": prompt})
@@ -333,10 +367,13 @@ with tab_chat:
                 r = requests.post(f"{rag_url}/v1/chat", headers=_h(), json=payload, timeout=300)
                 if r.status_code == 200:
                     res = r.json()
-                    answer, sources, memories = res["answer"], res.get("sources",[]), res.get("memories",[])
-                else: answer, sources, memories = f"Error: {r.text}", [], []
-            except Exception as e: answer, sources, memories = f"Failed: {e}", [], []
-        st.session_state.chat_messages.append({"role":"assistant","content":answer,"sources":sources,"memories":memories})
+                    answer = res["answer"]
+                    sources = res.get("sources", [])
+                    memories = res.get("memories", [])
+                    latency = res.get("latency", None)
+                else: answer, sources, memories, latency = f"Error: {r.text}", [], [], None
+            except Exception as e: answer, sources, memories, latency = f"Failed: {e}", [], [], None
+        st.session_state.chat_messages.append({"role":"assistant","content":answer,"sources":sources,"memories":memories,"latency":latency})
         st.rerun()
 
 # ========================================================================
