@@ -7,11 +7,14 @@ by default to avoid cascading LLM latency.
 """
 
 import os
+import re
 import json
 import logging
+from collections import Counter
 from typing import List, Dict, Optional
 
 import requests
+from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 from modules.qdrant_ops import search_hybrid, build_qdrant_filter
 from modules.embedder import embed_single
@@ -41,6 +44,126 @@ def _chat_completion(
 
 
 # ---------------------------------------------------------------------------
+# Fix 2: Filename / Document ID Detection
+# ---------------------------------------------------------------------------
+_DOC_ID_PATTERNS = [
+    re.compile(r'[A-Z]{2,}\d{8,}'),           # OST10618202482736145
+    re.compile(r'[A-Z]+-\d{4}-\d+'),           # RES-2024-001
+    re.compile(r'\b\d{4}-\d{3,}-\d{2,}\b'),    # 2024-001-123
+]
+
+
+def _detect_document_id(query: str, client, collection: str) -> Optional[str]:
+    """Check if query references a specific document by name/ID.
+    Uses scroll + Python-side matching (reliable with any index config)."""
+    for pattern in _DOC_ID_PATTERNS:
+        match = pattern.search(query)
+        if match:
+            candidate = match.group(0).lower()
+            try:
+                # Scroll unique filenames and match in Python
+                points, _ = client.scroll(
+                    collection_name=collection,
+                    limit=500,
+                    with_payload=["filename"],
+                )
+                seen = set()
+                for pt in points:
+                    fname = (pt.payload or {}).get("filename", "")
+                    if fname and fname not in seen:
+                        seen.add(fname)
+                        if candidate in fname.lower():
+                            log.info(f"Document ID detected: '{candidate}' → filename '{fname}'")
+                            return fname
+            except Exception as e:
+                log.warning(f"Document ID detection scroll failed: {e}")
+    return None
+
+
+def _fetch_all_document_chunks(client, collection: str, filename: str) -> list:
+    """Fetch ALL chunks for a specific document by filename."""
+    filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=filename))])
+    points, _ = client.scroll(
+        collection_name=collection, scroll_filter=filt,
+        limit=500, with_payload=True,
+    )
+    sources = []
+    for pt in points:
+        p = pt.payload or {}
+        sources.append({
+            "text": p.get("text", ""),
+            "filename": p.get("filename", ""),
+            "chunk_index": p.get("chunk_index", 0),
+            "section": p.get("section", ""),
+            "content_type": p.get("content_type", ""),
+            "score": 1.0,  # Direct match = highest relevance
+            "type": "direct_match",
+        })
+    sources.sort(key=lambda x: x["chunk_index"])
+    log.info(f"Direct retrieval: {len(sources)} chunks from '{filename}'")
+    return sources
+
+
+# ---------------------------------------------------------------------------
+# Fix 1: Context Window Expansion
+# ---------------------------------------------------------------------------
+def _expand_document_context(
+    client, collection: str, sources: list, max_expansion: int = 5,
+) -> list:
+    """
+    For high-signal documents (2+ chunks matched OR score > 0.7),
+    fetch ALL remaining chunks from those documents.
+    """
+    if not sources:
+        return sources
+
+    filename_counts = Counter(s["filename"] for s in sources)
+
+    # Documents with 2+ chunks in results = strong signal
+    expand_files = [f for f, c in filename_counts.items() if c >= 2]
+
+    # Also expand single-chunk docs with very high scores
+    for s in sources:
+        if s["score"] > 0.7 and s["filename"] not in expand_files:
+            expand_files.append(s["filename"])
+
+    expand_files = expand_files[:max_expansion]
+
+    if not expand_files:
+        return sources
+
+    existing_keys = {f"{s['filename']}__{s['chunk_index']}" for s in sources}
+    expanded_count = 0
+
+    for fname in expand_files:
+        filt = Filter(must=[FieldCondition(key="filename", match=MatchValue(value=fname))])
+        points, _ = client.scroll(
+            collection_name=collection, scroll_filter=filt,
+            limit=200, with_payload=True,
+        )
+        for pt in points:
+            p = pt.payload or {}
+            key = f"{p.get('filename', '')}__{p.get('chunk_index', 0)}"
+            if key not in existing_keys:
+                sources.append({
+                    "text": p.get("text", ""),
+                    "filename": p.get("filename", ""),
+                    "chunk_index": p.get("chunk_index", 0),
+                    "section": p.get("section", ""),
+                    "content_type": p.get("content_type", ""),
+                    "score": 0.5,  # Neutral score — kept unless truncation drops it
+                    "type": "expanded",
+                })
+                existing_keys.add(key)
+                expanded_count += 1
+
+    if expanded_count:
+        log.info(f"Context expansion: +{expanded_count} chunks from {len(expand_files)} docs ({', '.join(expand_files[:3])}...)")
+
+    return sources
+
+
+# ---------------------------------------------------------------------------
 # Core Retrieval (fast path — no LLM calls)
 # ---------------------------------------------------------------------------
 def retrieve(
@@ -54,15 +177,41 @@ def retrieve(
     filters: Optional[dict] = None,
 ) -> tuple:
     """
-    Fast retrieval: embed query → hybrid search → return sources.
+    Fast retrieval: embed query → hybrid search → expand context → return.
+    Now includes document ID detection and context window expansion.
     Returns (query_vector, sources_list).
     """
     query_vector = embed_single(query, embed_url, embed_model, embed_api_key)
-    qdrant_filter = build_qdrant_filter(filters)
 
+    # Fix 2: Check if query references a specific document
+    doc_filename = _detect_document_id(query, client, collection)
+    if doc_filename:
+        # Direct retrieval: get ALL chunks from the identified document
+        direct_sources = _fetch_all_document_chunks(client, collection, doc_filename)
+        if direct_sources:
+            # Also run normal search to find related context from other docs
+            qdrant_filter = build_qdrant_filter(filters)
+            other_results = search_hybrid(client, collection, query_vector, query, top_k, filt=qdrant_filter)
+            existing_keys = {f"{s['filename']}__{s['chunk_index']}" for s in direct_sources}
+            for pt in other_results:
+                p = pt.payload or {}
+                key = f"{p.get('filename', '')}__{p.get('chunk_index', 0)}"
+                if key not in existing_keys:
+                    direct_sources.append({
+                        "text": p.get("text", ""),
+                        "filename": p.get("filename", "unknown"),
+                        "chunk_index": p.get("chunk_index", 0),
+                        "section": p.get("section", ""),
+                        "content_type": p.get("content_type", ""),
+                        "score": pt.score,
+                        "type": "document",
+                    })
+            return query_vector, direct_sources
+
+    # Standard path: hybrid search
+    qdrant_filter = build_qdrant_filter(filters)
     results = search_hybrid(client, collection, query_vector, query, top_k, filt=qdrant_filter)
 
-    # Fallback: if filtered search returns nothing, try unfiltered
     if not results and qdrant_filter:
         log.info("Filtered search empty, retrying without filters")
         results = search_hybrid(client, collection, query_vector, query, top_k)
@@ -79,6 +228,9 @@ def retrieve(
             "score": pt.score,
             "type": "document",
         })
+
+    # Fix 1: Expand context for high-signal documents
+    sources = _expand_document_context(client, collection, sources)
 
     return query_vector, sources
 
@@ -209,6 +361,10 @@ def plan_query(
         query_vector = embed_single(query, embed_url, embed_model, embed_api_key)
 
     sources = sorted(all_sources.values(), key=lambda x: x["score"], reverse=True)
+
+    # Fix 1: Expand context for high-signal documents
+    sources = _expand_document_context(client, collection, sources)
+
     return query_vector, sources
 
 
@@ -243,7 +399,8 @@ def build_context(
             context_parts.append(f"{header}\n{s['text']}")
 
     context = "\n\n".join(context_parts)
-    est_tokens = len(context) // 3
+    # Conservative token estimate: ~2.5 chars/token for Qwen models
+    est_tokens = int(len(context) / 2.5)
 
     # Truncate by removing lowest-scoring sources
     original_count = len(working_sources)
@@ -261,7 +418,7 @@ def build_context(
                 header = f"[{s['filename']} | {s['section']} | {s['content_type']} | score {s['score']:.4f}]"
                 context_parts.append(f"{header}\n{s['text']}")
         context = "\n\n".join(context_parts)
-        est_tokens = len(context) // 3
+        est_tokens = int(len(context) / 2.5)
 
     if original_count != len(working_sources):
         log.info(f"Context truncated: {original_count} -> {len(working_sources)} sources ({est_tokens} est. tokens)")

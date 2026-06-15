@@ -126,7 +126,7 @@ def ensure_collection(client: QdrantClient, name: str, vector_size: int):
 
 def ensure_indexes(client: QdrantClient, collection: str):
     """Create payload indexes for filtered search (idempotent)."""
-    for field in ["metadata.doc_type", "metadata.tags", "metadata.date", "filename"]:
+    for field in ["metadata.doc_type", "metadata.tags", "metadata.date"]:
         try:
             client.create_payload_index(
                 collection_name=collection,
@@ -134,7 +134,16 @@ def ensure_indexes(client: QdrantClient, collection: str):
                 field_schema=PayloadSchemaType.KEYWORD,
             )
         except Exception:
-            pass  # Index may already exist
+            pass
+    # Keyword index on filename for exact match
+    try:
+        client.create_payload_index(
+            collection_name=collection,
+            field_name="filename",
+            field_schema=PayloadSchemaType.KEYWORD,
+        )
+    except Exception:
+        pass
 
 
 def is_hybrid_collection(client: QdrantClient, collection: str) -> bool:

@@ -67,7 +67,7 @@ RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
 MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "5"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
-MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 2048
+MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 4096
 
 # ---------------------------------------------------------------------------
 # API Key DB

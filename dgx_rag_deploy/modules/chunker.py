@@ -111,19 +111,37 @@ def _detect_type(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Sentence Splitting
 # ---------------------------------------------------------------------------
-def _split_sentences(text: str, max_size: int, header: str = "") -> List[str]:
-    """Split large prose at sentence/line boundaries, prepending header."""
+def _split_sentences(text: str, max_size: int, header: str = "", overlap_pct: float = 0.15) -> List[str]:
+    """Split large prose at sentence/line boundaries with overlap.
+    
+    Args:
+        overlap_pct: Fraction of previous chunk to repeat in the next chunk (0.15 = 15%).
+                     Ensures information at chunk boundaries is never lost.
+    """
     units = re.split(r'(?<=[.!?])\s+|\n', text)
     units = [u.strip() for u in units if u.strip()]
     chunks, current = [], header + "\n" if header else ""
+    current_units = []  # Track units in current chunk for overlap
+
     for unit in units:
         candidate = f"{current}\n{unit}" if current.strip() else (f"{header}\n{unit}" if header else unit)
         if len(candidate) <= max_size:
             current = candidate
+            current_units.append(unit)
         else:
             if current.strip() and current.strip() != header:
                 chunks.append(current)
-            current = f"{header}\n{unit}" if header else unit
+            # Calculate overlap: take last ~15% of units from the previous chunk
+            overlap_count = max(1, int(len(current_units) * overlap_pct))
+            overlap_units = current_units[-overlap_count:] if current_units else []
+            # Start new chunk with overlap + new unit
+            if overlap_units:
+                overlap_text = "\n".join(overlap_units)
+                current = f"{header}\n{overlap_text}\n{unit}" if header else f"{overlap_text}\n{unit}"
+            else:
+                current = f"{header}\n{unit}" if header else unit
+            current_units = overlap_units + [unit]
+
     if current.strip() and current.strip() != header:
         chunks.append(current)
     return chunks
