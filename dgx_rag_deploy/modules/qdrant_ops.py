@@ -112,6 +112,27 @@ def get_client(url: str = "http://localhost:6333") -> QdrantClient:
 
 
 # ---------------------------------------------------------------------------
+# Paginated Scroll Helper
+# ---------------------------------------------------------------------------
+def scroll_all(client: QdrantClient, collection: str, filt=None,
+               payload_keys=None, with_vectors: bool = False) -> list:
+    """Paginated scroll — fetches ALL matching points, following next_page_offset.
+    Fixes silent truncation when limit < total points."""
+    pts, offset = [], None
+    while True:
+        batch, offset = client.scroll(
+            collection_name=collection, scroll_filter=filt,
+            limit=500, offset=offset,
+            with_payload=payload_keys if payload_keys else True,
+            with_vectors=with_vectors,
+        )
+        pts.extend(batch)
+        if offset is None:
+            break
+    return pts
+
+
+# ---------------------------------------------------------------------------
 # Collection Management
 # ---------------------------------------------------------------------------
 def ensure_collection(client: QdrantClient, name: str, vector_size: int):

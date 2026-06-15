@@ -43,7 +43,9 @@ from modules.metadata import autotag_document, extract_filters_from_query
 from modules.qdrant_ops import (
     get_client, ensure_collection, ensure_indexes,
     delete_document_chunks, search_hybrid, build_qdrant_filter, tokenize_bm25,
+    scroll_all,
 )
+from modules.retriever import _is_broad_query
 
 load_dotenv()
 
@@ -300,7 +302,7 @@ async def get_session_info(name: str, api_key: str = Depends(verify_api_key)):
     count = info.points_count if hasattr(info, 'points_count') else 0
     filenames = set()
     try:
-        points, _ = client.scroll(collection_name=name, limit=200, with_payload=True)
+        points = scroll_all(client, name, payload_keys=["filename"])
         for pt in points:
             fn = (pt.payload or {}).get("filename")
             if fn:
@@ -407,7 +409,7 @@ async def list_documents(collection: str, api_key: str = Depends(verify_api_key)
     existing = {c.name for c in client.get_collections().collections}
     if collection not in existing:
         return {"documents": [], "count": 0}
-    points, _ = client.scroll(collection_name=collection, limit=5000, with_payload=True)
+    points = scroll_all(client, collection)
     docs = {}
     for pt in points:
         p = pt.payload or {}
@@ -575,8 +577,9 @@ async def chat_with_documents(
     use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
 
     # Check cache (only for stateless queries without session)
+    # F-8: Skip cache for broad queries — prevents stale results during active ingestion
     cache_k = None
-    if not session_id:
+    if not session_id and not _is_broad_query(query):
         cache_k = _cache_key(query, collection, top_k)
         cached = _cache_get(cache_k)
         if cached:
