@@ -37,6 +37,7 @@ import httpx
 
 from modules.embedder import embed_batch, embed_single
 from modules.chunker import chunk_markdown_structural
+from modules.document_converter import ConversionError, convert_to_markdown
 from modules.retriever import retrieve, plan_query, build_context
 from modules.reranker import rerank_with_server, rerank_with_llm
 from modules.memory import (
@@ -259,77 +260,6 @@ def _do_rerank(query: str, sources: list) -> list:
         return rerank_with_server(query, sources, RERANKER_URL, RERANKER_MODEL, RERANKER_API_KEY)
     else:
         return rerank_with_llm(query, sources, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY)
-
-# ===========================================================================
-# File Format Converters (DOCX, TXT, CSV → Markdown)
-# ===========================================================================
-def _convert_to_markdown(filename: str, content_bytes: bytes) -> Optional[str]:
-    """Convert DOCX/TXT/CSV bytes to markdown string. Returns None if unsupported."""
-    ext = os.path.splitext(filename)[1].lower()
-
-    if ext == ".txt":
-        return content_bytes.decode("utf-8", errors="replace")
-
-    if ext == ".csv":
-        text = content_bytes.decode("utf-8", errors="replace")
-        lines = text.strip().split("\n")
-        if not lines:
-            return ""
-        import csv, io
-        reader = csv.reader(io.StringIO(text))
-        rows = list(reader)
-        if not rows:
-            return ""
-        # Build markdown table
-        header = rows[0]
-        md = "| " + " | ".join(header) + " |\n"
-        md += "| " + " | ".join(["---"] * len(header)) + " |\n"
-        for row in rows[1:]:
-            # Pad/truncate to header length
-            padded = row + [""] * (len(header) - len(row))
-            md += "| " + " | ".join(padded[:len(header)]) + " |\n"
-        return md
-
-    if ext == ".docx":
-        try:
-            import docx
-            import io as _io
-            doc = docx.Document(_io.BytesIO(content_bytes))
-            parts = []
-            for para in doc.paragraphs:
-                text = para.text.strip()
-                if not text:
-                    continue
-                style = (para.style.name or "").lower()
-                if "heading 1" in style:
-                    parts.append(f"# {text}")
-                elif "heading 2" in style:
-                    parts.append(f"## {text}")
-                elif "heading 3" in style:
-                    parts.append(f"### {text}")
-                elif "heading" in style:
-                    parts.append(f"#### {text}")
-                else:
-                    parts.append(text)
-            # Handle tables
-            for table in doc.tables:
-                rows = []
-                for row in table.rows:
-                    cells = [cell.text.strip() for cell in row.cells]
-                    rows.append(cells)
-                if rows:
-                    md_table = "| " + " | ".join(rows[0]) + " |\n"
-                    md_table += "| " + " | ".join(["---"] * len(rows[0])) + " |\n"
-                    for r in rows[1:]:
-                        padded = r + [""] * (len(rows[0]) - len(r))
-                        md_table += "| " + " | ".join(padded[:len(rows[0])]) + " |\n"
-                    parts.append(md_table)
-            return "\n\n".join(parts)
-        except ImportError:
-            log.warning("python-docx not installed — DOCX support unavailable")
-            return None
-
-    return None  # Unsupported format
 
 # ===========================================================================
 # Endpoints: Sessions
@@ -563,34 +493,48 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
             "filename": filename, "sections": sections_summary, "metadata": metadata}
 
 
+def _attach_conversion_telemetry(result: dict, conversion) -> dict:
+    if conversion:
+        result["conversion_strategy"] = conversion.strategy
+        result["source_ext"] = conversion.source_ext
+        result["conversion_warnings"] = conversion.warnings
+    return result
+
+
 @app.post("/v1/ingest", tags=["RAG"])
 async def ingest_document(
     api_key: str = Depends(verify_api_key),
     filename: str = Body(..., embed=True),
     markdown_content: str = Body(None, embed=True),
-    raw_content_b64: str = Body(None, embed=True, description="Base64-encoded DOCX/TXT/CSV file"),
+    raw_content_b64: str = Body(None, embed=True, description="Base64-encoded supported document file"),
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
     metadata: dict = Body(None, embed=True),
 ):
-    """Ingest a document. Supports markdown directly, or DOCX/TXT/CSV via raw_content_b64."""
+    """Ingest a document. Supports markdown directly, or supported files via raw_content_b64."""
     collection = collection or QDRANT_COLLECTION
     chunk_size = chunk_size or RAG_CHUNK_SIZE
     metadata = metadata or {}
+    conversion = None
 
     # Handle non-markdown file formats
     if not markdown_content and raw_content_b64:
         import base64
-        raw_bytes = base64.b64decode(raw_content_b64)
-        markdown_content = _convert_to_markdown(filename, raw_bytes)
-        if markdown_content is None:
-            raise HTTPException(status_code=400, detail=f"Unsupported file format: {filename}")
+        try:
+            raw_bytes = base64.b64decode(raw_content_b64)
+            conversion = convert_to_markdown(filename, raw_bytes)
+            markdown_content = conversion.markdown
+        except ConversionError as e:
+            raise HTTPException(status_code=e.status_code, detail={"error": str(e), "warnings": e.warnings})
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Document conversion failed: {str(e)}")
 
     if not markdown_content:
         raise HTTPException(status_code=400, detail="No content provided (markdown_content or raw_content_b64 required)")
 
     try:
-        return _do_ingest(filename, markdown_content, collection, chunk_size, metadata, api_key)
+        result = _do_ingest(filename, markdown_content, collection, chunk_size, metadata, api_key)
+        return _attach_conversion_telemetry(result, conversion)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
@@ -598,7 +542,7 @@ async def ingest_document(
 @app.post("/v1/ingest/batch", tags=["RAG"])
 async def ingest_batch(
     api_key: str = Depends(verify_api_key),
-    documents: List[dict] = Body(..., embed=True, description="List of {filename, markdown_content, metadata?}"),
+    documents: List[dict] = Body(..., embed=True, description="List of {filename, markdown_content or raw_content_b64, metadata?}"),
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
 ):
@@ -613,9 +557,19 @@ async def ingest_batch(
             fname = doc.get("filename", "unknown")
             content = doc.get("markdown_content", "")
             meta = doc.get("metadata", {})
+            conversion = None
             try:
+                if not content and doc.get("raw_content_b64"):
+                    import base64
+                    raw_bytes = base64.b64decode(doc["raw_content_b64"])
+                    conversion = convert_to_markdown(fname, raw_bytes)
+                    content = conversion.markdown
+                if not content:
+                    return {"status": "error", "filename": fname, "error": "No content provided"}
                 r = await asyncio.to_thread(_do_ingest, fname, content, collection, chunk_size, meta, api_key)
-                return r
+                return _attach_conversion_telemetry(r, conversion)
+            except ConversionError as e:
+                return {"status": "error", "filename": fname, "error": str(e), "warnings": e.warnings}
             except Exception as e:
                 return {"status": "error", "filename": fname, "error": str(e)}
 

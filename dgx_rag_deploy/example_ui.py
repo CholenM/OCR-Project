@@ -3,6 +3,7 @@ OCR + RAG Control Center v4
 Usage: streamlit run example_ui.py
 """
 import io
+import base64
 import json
 import os
 import re
@@ -19,6 +20,30 @@ DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 QDRANT_DASHBOARD = os.getenv("QDRANT_DASHBOARD", "http://192.168.50.153:6333/dashboard")
 BATCH_SIZE = 3
 DOC_TYPES = ["invoice", "contract", "report", "letter", "memo", "receipt", "policy", "form", "certificate", "other"]
+OCR_UPLOAD_TYPES = ["pdf", "jpg", "jpeg", "png"]
+DOCUMENT_UPLOAD_TYPES = ["md", "txt", "csv", "docx", "doc", "dotx", "odt", "rtf", "xls", "xlsx", "xlsm", "xlsb", "xlt", "ppt", "pptx"]
+DIRECT_UPLOAD_TYPES = set(DOCUMENT_UPLOAD_TYPES)
+
+
+def _default_advanced_settings():
+    return {
+        "top_k": 15,
+        "memory_enabled": True,
+        "memory_top_k": 5,
+        "streaming_enabled": True,
+        "rerank": False,
+        "agentic": False,
+        "auto_extract": False,
+        "hyde": False,
+        "f_doc_type": "(none)",
+        "f_tags": "",
+        "f_date_from": "",
+        "f_date_to": "",
+        "system_prompt": (
+            "You are a helpful RAG assistant. Use the provided context to answer accurately. "
+            "For basic questions, answer naturally. Cite sources when referencing documents."
+        ),
+    }
 
 st.set_page_config(page_title="OCR + RAG Workspace", page_icon="", layout="wide")
 
@@ -47,8 +72,10 @@ st.markdown(
 
 
 def _init_state():
+    advanced_defaults = _default_advanced_settings()
     defaults = {
         "ocr_results": {},
+        "raw_documents": {},
         "ocr_metadata": {},
         "chat_messages": [],
         "active_session": None,
@@ -57,26 +84,17 @@ def _init_state():
         "ocr_step": 1,
         "chat_loaded_for": None,
         "nav": "Chat",
-        "chat_top_k": 15,
-        "memory_enabled": True,
-        "memory_top_k": 5,
-        "streaming_enabled": True,
-        "rerank_enabled": False,
-        "agentic_enabled": False,
-        "auto_extract": False,
-        "hyde_enabled": False,
-        "f_doc_type": "(none)",
-        "f_tags": "",
-        "f_date_from": "",
-        "f_date_to": "",
-        "system_prompt": (
-            "You are a helpful RAG assistant. Use the provided context to answer accurately. "
-            "For basic questions, answer naturally. Cite sources when referencing documents."
-        ),
+        "draft_settings": dict(advanced_defaults),
+        "applied_settings": dict(advanced_defaults),
+        "settings_applied_at": None,
+        "settings_flash": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+    for key, value in advanced_defaults.items():
+        st.session_state.draft_settings.setdefault(key, value)
+        st.session_state.applied_settings.setdefault(key, value)
 
 
 _init_state()
@@ -177,16 +195,91 @@ def _autotag(name, markdown, endpoint, headers):
     return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
 
 
+def _is_direct_upload(filename: str) -> bool:
+    return os.path.splitext(filename)[1].lower().lstrip(".") in DIRECT_UPLOAD_TYPES
+
+
+def _service_link(label: str, url: str):
+    if hasattr(st, "link_button"):
+        st.link_button(label, url, use_container_width=True)
+    else:
+        st.markdown(f"[{label}]({url})")
+
+
+def _settings():
+    return st.session_state.applied_settings
+
+
+def _sync_draft_from_widgets():
+    draft = st.session_state.draft_settings
+    for key in _default_advanced_settings():
+        widget_key = f"draft_{key}"
+        if widget_key in st.session_state:
+            draft[key] = st.session_state[widget_key]
+
+
+def _sync_widgets_from_draft():
+    for key, value in st.session_state.draft_settings.items():
+        st.session_state[f"draft_{key}"] = value
+
+
+def _ensure_draft_widget_keys():
+    for key, value in st.session_state.draft_settings.items():
+        st.session_state.setdefault(f"draft_{key}", value)
+
+
+def _apply_advanced_settings():
+    _sync_draft_from_widgets()
+    st.session_state.applied_settings = dict(st.session_state.draft_settings)
+    st.session_state.settings_applied_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state.settings_flash = ("success", "Advanced settings applied. Check the Streamlit terminal for the applied snapshot.")
+    s = st.session_state.applied_settings
+    print(
+        "ADVANCED SETTINGS APPLIED | "
+        f"session={st.session_state.get('active_session') or '(none)'} | "
+        f"streaming={str(s['streaming_enabled']).lower()} | "
+        f"rerank={str(s['rerank']).lower()} | "
+        f"agentic={str(s['agentic']).lower()} | "
+        f"top_k={int(s['top_k'])} | "
+        f"memory={str(s['memory_enabled']).lower()} | "
+        f"memory_top_k={int(s['memory_top_k'])} | "
+        f"hyde={str(s['hyde']).lower()} | "
+        f"auto_filters={str(s['auto_extract']).lower()} | "
+        f"doc_type={s['f_doc_type']} | "
+        f"tags={s['f_tags'] or '(none)'} | "
+        f"date_from={s['f_date_from'] or '(none)'} | "
+        f"date_to={s['f_date_to'] or '(none)'}",
+        flush=True,
+    )
+
+
+def _reset_draft_to_applied():
+    st.session_state.draft_settings = dict(st.session_state.applied_settings)
+    _sync_widgets_from_draft()
+    st.session_state.settings_flash = ("info", "Draft settings reset to the currently applied values.")
+
+
+def _restore_default_settings():
+    defaults = _default_advanced_settings()
+    st.session_state.draft_settings = dict(defaults)
+    st.session_state.applied_settings = dict(defaults)
+    st.session_state.settings_applied_at = time.strftime("%Y-%m-%d %H:%M:%S")
+    _sync_widgets_from_draft()
+    st.session_state.settings_flash = ("warning", "Advanced settings restored to defaults.")
+    print("ADVANCED SETTINGS RESTORED TO DEFAULTS", flush=True)
+
+
 def manual_filters():
+    settings = _settings()
     filters = {}
-    if st.session_state.f_doc_type != "(none)":
-        filters["doc_type"] = st.session_state.f_doc_type
-    if st.session_state.f_tags:
-        filters["tags"] = [t.strip() for t in st.session_state.f_tags.split(",") if t.strip()]
-    if st.session_state.f_date_from:
-        filters["date_from"] = st.session_state.f_date_from
-    if st.session_state.f_date_to:
-        filters["date_to"] = st.session_state.f_date_to
+    if settings["f_doc_type"] != "(none)":
+        filters["doc_type"] = settings["f_doc_type"]
+    if settings["f_tags"]:
+        filters["tags"] = [t.strip() for t in settings["f_tags"].split(",") if t.strip()]
+    if settings["f_date_from"]:
+        filters["date_from"] = settings["f_date_from"]
+    if settings["f_date_to"]:
+        filters["date_to"] = settings["f_date_to"]
     return filters
 
 
@@ -215,22 +308,23 @@ def render_chat_message(msg):
 
 
 def ask_streaming(prompt: str, active: str):
+    settings = _settings()
     payload = {
         "query": prompt,
         "collection": active,
-        "top_k": int(st.session_state.chat_top_k),
+        "top_k": int(settings["top_k"]),
         "session_id": active,
-        "memory_enabled": st.session_state.memory_enabled,
-        "memory_top_k": int(st.session_state.memory_top_k),
-        "rerank": st.session_state.rerank_enabled,
-        "agentic": st.session_state.agentic_enabled,
-        "hyde": st.session_state.hyde_enabled,
+        "memory_enabled": settings["memory_enabled"],
+        "memory_top_k": int(settings["memory_top_k"]),
+        "rerank": settings["rerank"],
+        "agentic": settings["agentic"],
+        "hyde": settings["hyde"],
     }
     filters = manual_filters()
     if filters:
         payload["filters"] = filters
-    if st.session_state.system_prompt:
-        payload["system_prompt"] = st.session_state.system_prompt
+    if settings["system_prompt"]:
+        payload["system_prompt"] = settings["system_prompt"]
 
     answer_placeholder = st.empty()
     status_placeholder = st.empty()
@@ -301,23 +395,24 @@ def ask_streaming(prompt: str, active: str):
 
 
 def ask_non_streaming(prompt: str, active: str):
+    settings = _settings()
     payload = {
         "query": prompt,
         "collection": active,
-        "top_k": int(st.session_state.chat_top_k),
+        "top_k": int(settings["top_k"]),
         "session_id": active,
-        "memory_enabled": st.session_state.memory_enabled,
-        "memory_top_k": int(st.session_state.memory_top_k),
-        "auto_extract_filters": st.session_state.auto_extract,
-        "rerank": st.session_state.rerank_enabled,
-        "agentic": st.session_state.agentic_enabled,
-        "hyde": st.session_state.hyde_enabled,
+        "memory_enabled": settings["memory_enabled"],
+        "memory_top_k": int(settings["memory_top_k"]),
+        "auto_extract_filters": settings["auto_extract"],
+        "rerank": settings["rerank"],
+        "agentic": settings["agentic"],
+        "hyde": settings["hyde"],
     }
     filters = manual_filters()
     if filters:
         payload["filters"] = filters
-    if st.session_state.system_prompt:
-        payload["system_prompt"] = st.session_state.system_prompt
+    if settings["system_prompt"]:
+        payload["system_prompt"] = settings["system_prompt"]
     try:
         r = requests.post(f"{st.session_state.rag_url}/v1/chat", headers=_headers(), json=payload, timeout=300)
         if r.status_code == 200:
@@ -449,7 +544,7 @@ def render_chat():
         render_chat_message(user_msg)
 
         with st.chat_message("assistant"):
-            assistant_msg = ask_streaming(prompt, active) if st.session_state.streaming_enabled else ask_non_streaming(prompt, active)
+            assistant_msg = ask_streaming(prompt, active) if _settings()["streaming_enabled"] else ask_non_streaming(prompt, active)
             render_sources_and_memory(assistant_msg)
 
         st.session_state.chat_messages.append(assistant_msg)
@@ -462,35 +557,47 @@ def render_ocr_dashboard():
     st.subheader(f"Step 1: Upload & Process {'complete' if has_results else ''}")
     if not has_results:
         uploaded_files = st.file_uploader(
-            "Upload Documents (PDF, JPG, PNG)",
-            type=["pdf", "jpg", "png"],
+            "Upload Documents",
+            type=OCR_UPLOAD_TYPES + DOCUMENT_UPLOAD_TYPES,
             accept_multiple_files=True,
             key=f"uploader_{st.session_state.uploader_key}",
         )
         if uploaded_files:
             st.caption(f"{len(uploaded_files)} file(s) selected")
-        has_pdf = any(f.type == "application/pdf" for f in (uploaded_files or []))
+        ocr_uploads = [f for f in (uploaded_files or []) if not _is_direct_upload(f.name)]
+        direct_uploads = [f for f in (uploaded_files or []) if _is_direct_upload(f.name)]
+        has_pdf = any(f.type == "application/pdf" for f in ocr_uploads)
         if has_pdf:
             dpi_value = st.slider("DPI", 120, 350, 200, 10)
             mode_value = st.selectbox("Mode", ["serial", "concurrent"], index=1)
         else:
             dpi_value, mode_value = 200, "concurrent"
 
-        if st.button("Execute OCR + Auto-Tag", use_container_width=True, type="primary"):
+        if st.button("Process files", use_container_width=True, type="primary"):
             if not st.session_state.api_key_input or not uploaded_files:
                 st.warning("Provide API key and upload files.")
             else:
-                total = len(uploaded_files)
-                results, meta_results = {}, {}
+                total = len(ocr_uploads)
+                results, raw_documents, meta_results = {}, {}, {}
                 params = {"dpi": dpi_value, "mode": mode_value}
                 if mode_value == "concurrent":
                     params["max_concurrency"] = 4
-                file_data = [(f.name, f.getvalue(), f.type) for f in uploaded_files]
+                file_data = [(f.name, f.getvalue(), f.type) for f in ocr_uploads]
 
-                with st.status(f"Processing {total} file(s)...", expanded=True) as sb:
+                with st.status(f"Processing {len(uploaded_files)} file(s)...", expanded=True) as sb:
                     t0 = time.time()
-                    prog = st.progress(0, text=f"0 / {total}")
+                    prog = st.progress(0, text=f"0 / {len(uploaded_files)}")
                     done = 0
+                    for f in direct_uploads:
+                        data = f.getvalue()
+                        raw_documents[f.name] = {
+                            "raw_content_b64": base64.b64encode(data).decode("utf-8"),
+                            "size": len(data),
+                        }
+                        meta_results[f.name] = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+                        done += 1
+                        prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
+                        st.write(f"`{f.name}` ready for RAG conversion")
                     for batch_start in range(0, total, BATCH_SIZE):
                         batch = file_data[batch_start:batch_start + BATCH_SIZE]
                         slots = {n: st.empty() for n, _, _ in batch}
@@ -510,24 +617,25 @@ def render_ocr_dashboard():
                                     slots[nm].markdown(f"`{n}` done: {lat:.1f}s | {tps:.0f} tok/s")
                                     results[n] = md
                                 done += 1
-                                prog.progress(done / total, text=f"{done}/{total}")
+                                prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
                     if results:
                         st.write("Auto-tagging...")
                         for fname, md_text in results.items():
                             meta_results[fname] = _autotag(fname, md_text, f"{st.session_state.rag_url}/v1/autotag", _headers())
-                    sb.update(label=f"Done: {len(results)} files in {time.time() - t0:.1f}s", state="complete")
+                    sb.update(label=f"Done: {len(results) + len(raw_documents)} files in {time.time() - t0:.1f}s", state="complete")
 
-                if results:
+                if results or raw_documents:
                     st.session_state.ocr_results = results
+                    st.session_state.raw_documents = raw_documents
                     st.session_state.ocr_metadata = meta_results
                     st.session_state.ocr_step = 2
                     st.session_state.uploader_key += 1
                     st.rerun()
     else:
-        rnames = list(st.session_state.ocr_results.keys())
+        rnames = list(st.session_state.ocr_results.keys()) + list(st.session_state.raw_documents.keys())
         st.success(f"{len(rnames)} file(s) processed: {', '.join(rnames)}")
         col_dl, col_clr = st.columns(2)
-        for i, fname in enumerate(rnames):
+        for i, fname in enumerate(st.session_state.ocr_results.keys()):
             base = os.path.splitext(fname)[0]
             st.download_button(
                 f"{base}.md",
@@ -552,6 +660,7 @@ def render_ocr_dashboard():
             )
         if col_clr.button("Start new OCR", use_container_width=True):
             st.session_state.ocr_results = {}
+            st.session_state.raw_documents = {}
             st.session_state.ocr_metadata = {}
             st.session_state.ocr_step = 1
             st.session_state.uploader_key += 1
@@ -560,7 +669,7 @@ def render_ocr_dashboard():
     if has_results:
         st.markdown("---")
         st.subheader("Step 2: Review & Edit Metadata")
-        rnames = list(st.session_state.ocr_results.keys())
+        rnames = list(st.session_state.ocr_results.keys()) + list(st.session_state.raw_documents.keys())
         edit_file = st.selectbox("Select file", rnames, key="meta_edit_file")
         meta = st.session_state.ocr_metadata.get(edit_file, {})
         key_base = f"ocr_meta_{edit_file}"
@@ -598,8 +707,13 @@ def render_ocr_dashboard():
         with st.expander("Document Preview"):
             pf = st.selectbox("File", rnames, key="preview_sel")
             l, r_ = st.columns(2, gap="large")
-            l.text_area("raw", value=st.session_state.ocr_results[pf], height=300, label_visibility="collapsed")
-            r_.markdown(st.session_state.ocr_results[pf], unsafe_allow_html=True)
+            if pf in st.session_state.ocr_results:
+                l.text_area("raw", value=st.session_state.ocr_results[pf], height=300, label_visibility="collapsed")
+                r_.markdown(st.session_state.ocr_results[pf], unsafe_allow_html=True)
+            else:
+                raw_meta = st.session_state.raw_documents.get(pf, {})
+                l.text_area("raw", value=f"{pf}\n{raw_meta.get('size', 0)} bytes\nConverted during RAG ingestion.", height=300, label_visibility="collapsed")
+                r_.info("This file will be converted to Markdown by the RAG API during ingestion.")
 
         st.markdown("---")
         st.subheader("Step 3: Ingest to Session")
@@ -607,7 +721,7 @@ def render_ocr_dashboard():
         if not target:
             st.warning("Create or select a session in the sidebar first.")
         else:
-            rnames = list(st.session_state.ocr_results.keys())
+            rnames = list(st.session_state.ocr_results.keys()) + list(st.session_state.raw_documents.keys())
             st.info(f"{len(rnames)} file(s) will be ingested into session {target}. Re-ingest overwrites matching filenames.")
             chunk_size = st.number_input("Chunk Size", 200, 4000, 1200, 50)
             if st.button("Ingest to vector store", use_container_width=True, type="primary"):
@@ -618,11 +732,14 @@ def render_ocr_dashboard():
                         meta = st.session_state.ocr_metadata.get(fname, {})
                         payload = {
                             "filename": fname,
-                            "markdown_content": st.session_state.ocr_results[fname],
                             "collection": target,
                             "chunk_size": int(chunk_size),
                             "metadata": meta,
                         }
+                        if fname in st.session_state.ocr_results:
+                            payload["markdown_content"] = st.session_state.ocr_results[fname]
+                        else:
+                            payload["raw_content_b64"] = st.session_state.raw_documents[fname]["raw_content_b64"]
                         st.write(f"[{i + 1}/{len(rnames)}] `{fname}`")
                         try:
                             r = requests.post(f"{st.session_state.rag_url}/v1/ingest", headers=_headers(), json=payload, timeout=120)
@@ -726,42 +843,79 @@ def render_data_manager():
 
 
 def render_advanced_settings():
+    _ensure_draft_widget_keys()
     st.title("Advanced Settings")
+    flash = st.session_state.get("settings_flash")
+    if flash:
+        level, message = flash
+        getattr(st, level)(message)
+        st.session_state.settings_flash = None
     st.subheader("Service Links")
     c1, c2 = st.columns(2)
-    c1.link_button("Qdrant Dashboard", QDRANT_DASHBOARD, use_container_width=True)
-    c2.link_button("Swagger UI", f"{st.session_state.rag_url}/docs", use_container_width=True)
+    with c1:
+        _service_link("Qdrant Dashboard", QDRANT_DASHBOARD)
+    with c2:
+        _service_link("Swagger UI", f"{st.session_state.rag_url}/docs")
+
+    applied = st.session_state.applied_settings
+    applied_at = st.session_state.settings_applied_at or "initial defaults"
+    st.subheader("Currently Applied")
+    st.caption(f"Last applied: {applied_at}")
+    st.code(
+        " | ".join([
+            f"streaming={str(applied['streaming_enabled']).lower()}",
+            f"rerank={str(applied['rerank']).lower()}",
+            f"agentic={str(applied['agentic']).lower()}",
+            f"hyde={str(applied['hyde']).lower()}",
+            f"auto_filters={str(applied['auto_extract']).lower()}",
+            f"top_k={int(applied['top_k'])}",
+            f"memory={str(applied['memory_enabled']).lower()}",
+            f"memory_top_k={int(applied['memory_top_k'])}",
+        ]),
+        language="text",
+    )
 
     st.subheader("Retrieval Engine")
     cols = st.columns(5)
     with cols[0]:
-        st.checkbox("Re-ranking", key="rerank_enabled", help="LLM re-scores chunks for precision.")
+        st.checkbox("Re-ranking", key="draft_rerank", help="LLM re-scores chunks for precision.")
     with cols[1]:
-        st.checkbox("Agentic RAG", key="agentic_enabled", help="Decomposes complex queries into sub-queries.")
+        st.checkbox("Agentic RAG", key="draft_agentic", help="Decomposes complex queries into sub-queries.")
     with cols[2]:
-        st.checkbox("Auto Filters", key="auto_extract", help="LLM extracts metadata filters from query in non-streaming mode.")
+        st.checkbox("Auto Filters", key="draft_auto_extract", help="LLM extracts metadata filters from query in non-streaming mode.")
     with cols[3]:
-        st.checkbox("HyDE", key="hyde_enabled", help="Generates a hypothetical answer for better embeddings.")
+        st.checkbox("HyDE", key="draft_hyde", help="Generates a hypothetical answer for better embeddings.")
     with cols[4]:
-        st.checkbox("Streaming", key="streaming_enabled", help="Stream tokens as they are generated.")
+        st.checkbox("Streaming", key="draft_streaming_enabled", help="Stream tokens as they are generated.")
 
     cl, cr = st.columns(2)
     with cl:
-        st.number_input("Top K", 1, 50, key="chat_top_k")
-        st.checkbox("Memory", key="memory_enabled")
-        st.number_input("Memory Top K", 1, 20, key="memory_top_k")
+        st.number_input("Top K", 1, 50, key="draft_top_k")
+        st.checkbox("Memory", key="draft_memory_enabled")
+        st.number_input("Memory Top K", 1, 20, key="draft_memory_top_k")
     with cr:
-        st.text_area("System Prompt", key="system_prompt", height=140)
+        st.text_area("System Prompt", key="draft_system_prompt", height=140)
 
     st.subheader("Manual Filters")
     fc1, fc2, fc3 = st.columns(3)
     with fc1:
-        st.selectbox("Doc Type Filter", ["(none)"] + DOC_TYPES, key="f_doc_type")
+        st.selectbox("Doc Type Filter", ["(none)"] + DOC_TYPES, key="draft_f_doc_type")
     with fc2:
-        st.text_input("Tags Filter (comma-separated)", key="f_tags")
+        st.text_input("Tags Filter (comma-separated)", key="draft_f_tags")
     with fc3:
-        st.text_input("Date From", key="f_date_from")
-        st.text_input("Date To", key="f_date_to")
+        st.text_input("Date From", key="draft_f_date_from")
+        st.text_input("Date To", key="draft_f_date_to")
+
+    ac1, ac2, ac3 = st.columns(3)
+    if ac1.button("Apply Settings", type="primary", use_container_width=True):
+        _apply_advanced_settings()
+        st.rerun()
+    if ac2.button("Reset Draft", use_container_width=True):
+        _reset_draft_to_applied()
+        st.rerun()
+    if ac3.button("Restore Defaults", use_container_width=True):
+        _restore_default_settings()
+        st.rerun()
 
 
 render_sidebar()
