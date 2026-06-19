@@ -1,6 +1,7 @@
 __pycache__/Fast_API_Integration.cpython-314.pyc
 dgx_rag_deploy/chat_history.json
 dgx_rag_deploy/chat_history.json.tmp
+dgx_spark_deploy/ocr_jobs/
 
 Test_Outputs/
 System_Architecture/

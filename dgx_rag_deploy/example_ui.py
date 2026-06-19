@@ -19,6 +19,7 @@ DEFAULT_OCR_URL = os.getenv("OCR_API_URL", "http://192.168.50.153:8080")
 DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 QDRANT_DASHBOARD = os.getenv("QDRANT_DASHBOARD", "http://192.168.50.153:6333/dashboard")
 BATCH_SIZE = 3
+OCR_JOB_POLL_SECONDS = float(os.getenv("OCR_STATUS_POLL_SECONDS", "2"))
 DOC_TYPES = ["invoice", "contract", "report", "letter", "memo", "receipt", "policy", "form", "certificate", "other"]
 OCR_UPLOAD_TYPES = ["pdf", "jpg", "jpeg", "png"]
 DOCUMENT_UPLOAD_TYPES = ["md", "txt", "csv", "docx", "doc", "dotx", "odt", "rtf", "xls", "xlsx", "xlsm", "xlsb", "xlt", "ppt", "pptx"]
@@ -76,6 +77,9 @@ def _init_state():
     defaults = {
         "ocr_results": {},
         "raw_documents": {},
+        "pending_raw_documents": {},
+        "ocr_jobs": {},
+        "ocr_job_failures": {},
         "ocr_metadata": {},
         "chat_messages": [],
         "active_session": None,
@@ -175,14 +179,87 @@ def create_session(name: str):
         st.sidebar.error(str(e))
 
 
-def _ocr_file(name, data, ctype, endpoint, headers, params):
+def _submit_ocr_job(name, data, ctype, endpoint, headers, params):
     try:
-        r = requests.post(endpoint, headers=headers, files={"file": (name, data, ctype)}, params=params, timeout=300)
-        if r.status_code == 200:
-            return (name, r.text, float(r.headers.get("X-Process-Time", 0)), float(r.headers.get("X-Tokens-Per-Sec", 0)), None)
-        return (name, None, 0, 0, f"HTTP {r.status_code}")
+        r = requests.post(endpoint, headers=headers, files={"file": (name, data, ctype)}, params=params, timeout=60)
+        if r.status_code == 202:
+            return name, r.json(), None
+        return name, None, f"HTTP {r.status_code}: {r.text[:300]}"
     except Exception as e:
-        return (name, None, 0, 0, str(e))
+        return name, None, str(e)
+
+
+def _poll_ocr_jobs():
+    """Refresh active OCR job state and fetch completed Markdown once."""
+    jobs = st.session_state.ocr_jobs
+    for filename, job in list(jobs.items()):
+        job_id = job.get("job_id")
+        if not job_id:
+            st.session_state.ocr_job_failures[filename] = "OCR job was submitted without a job ID."
+            job["status"] = "failed"
+            continue
+        try:
+            response = requests.get(
+                f"{st.session_state.ocr_url}/v1/ocr/jobs/{job_id}",
+                headers=_headers(),
+                timeout=10,
+            )
+            if response.status_code != 200:
+                job["status"] = "failed"
+                job["error"] = f"Status HTTP {response.status_code}: {response.text[:300]}"
+                st.session_state.ocr_job_failures[filename] = job["error"]
+                continue
+
+            current = response.json()
+            job.update(current)
+            if current.get("status") == "failed":
+                st.session_state.ocr_job_failures[filename] = current.get("error", "OCR job failed.")
+                continue
+
+            if current.get("status") == "completed" and not job.get("result_fetched"):
+                result_response = requests.get(
+                    f"{st.session_state.ocr_url}/v1/ocr/jobs/{job_id}/result",
+                    headers=_headers(),
+                    timeout=30,
+                )
+                if result_response.status_code == 200:
+                    markdown = result_response.text
+                    st.session_state.ocr_results[filename] = markdown
+                    st.session_state.ocr_metadata[filename] = _autotag(
+                        filename,
+                        markdown,
+                        f"{st.session_state.rag_url}/v1/autotag",
+                        _headers(),
+                    )
+                    job["result_fetched"] = True
+                else:
+                    job["result_error"] = f"Result HTTP {result_response.status_code}: {result_response.text[:300]}"
+                    if result_response.status_code in {404, 422}:
+                        job["status"] = "failed"
+                        st.session_state.ocr_job_failures[filename] = job["result_error"]
+        except Exception as e:
+            job["poll_error"] = str(e)
+
+
+def _ocr_jobs_are_terminal() -> bool:
+    if not st.session_state.ocr_jobs:
+        return False
+    for job in st.session_state.ocr_jobs.values():
+        if job.get("status") == "failed":
+            continue
+        if job.get("status") == "completed" and job.get("result_fetched"):
+            continue
+        return False
+    return True
+
+
+def _finalize_ocr_jobs():
+    """Move deferred conversion files into the normal Step 2/Step 3 workflow."""
+    st.session_state.raw_documents.update(st.session_state.pending_raw_documents)
+    st.session_state.pending_raw_documents = {}
+    st.session_state.ocr_jobs = {}
+    st.session_state.ocr_step = 2
+    st.session_state.uploader_key += 1
 
 
 def _autotag(name, markdown, endpoint, headers):
@@ -552,7 +629,42 @@ def render_chat():
 
 def render_ocr_dashboard():
     st.title("OCR Dashboard")
+
+    if st.session_state.ocr_jobs:
+        _poll_ocr_jobs()
+        st.subheader("Step 1: OCR Jobs Running")
+        st.caption("Large documents continue on the OCR server while this page polls for progress.")
+        for filename, job in st.session_state.ocr_jobs.items():
+            status = job.get("status", "queued")
+            total = int(job.get("pages_total", 0))
+            completed = int(job.get("pages_completed", 0))
+            st.markdown(f"**{filename}** - {status}")
+            if total:
+                st.progress(min(completed / total, 1.0), text=f"{completed} / {total} pages")
+            else:
+                st.caption("Queued for OCR processing...")
+            st.caption(
+                f"Elapsed: {job.get('elapsed_seconds', 0)}s | "
+                f"Tokens: {int(job.get('input_tokens', 0)) + int(job.get('output_tokens', 0)):,}"
+            )
+            if job.get("page_failures"):
+                st.warning(f"{filename}: {len(job['page_failures'])} page(s) failed; successful pages will be retained.")
+            if job.get("error") or job.get("result_error") or job.get("poll_error"):
+                st.error(f"{filename}: {job.get('error') or job.get('result_error') or job.get('poll_error')}")
+
+        if _ocr_jobs_are_terminal():
+            _finalize_ocr_jobs()
+            st.rerun()
+
+        time.sleep(OCR_JOB_POLL_SECONDS)
+        st.rerun()
+
     has_results = bool(st.session_state.ocr_results or st.session_state.raw_documents)
+
+    if st.session_state.ocr_job_failures:
+        st.subheader("OCR Job Failures")
+        for filename, error in st.session_state.ocr_job_failures.items():
+            st.error(f"{filename}: {error}")
 
     st.subheader(f"Step 1: Upload & Prepare {'complete' if has_results else ''}")
     if not has_results:
@@ -578,23 +690,28 @@ def render_ocr_dashboard():
                 st.warning("Provide API key and upload files.")
             else:
                 total = len(ocr_uploads)
-                results, raw_documents, meta_results = {}, {}, {}
+                st.session_state.ocr_results = {}
+                st.session_state.raw_documents = {}
+                st.session_state.pending_raw_documents = {}
+                st.session_state.ocr_jobs = {}
+                st.session_state.ocr_job_failures = {}
+                st.session_state.ocr_metadata = {}
                 params = {"dpi": dpi_value, "mode": mode_value}
                 if mode_value == "concurrent":
                     params["max_concurrency"] = 4
                 file_data = [(f.name, f.getvalue(), f.type) for f in ocr_uploads]
 
-                with st.status(f"Processing {len(uploaded_files)} file(s)...", expanded=True) as sb:
+                with st.status(f"Submitting {len(uploaded_files)} file(s)...", expanded=True) as sb:
                     t0 = time.time()
                     prog = st.progress(0, text=f"0 / {len(uploaded_files)}")
                     done = 0
                     for f in direct_uploads:
                         data = f.getvalue()
-                        raw_documents[f.name] = {
+                        st.session_state.pending_raw_documents[f.name] = {
                             "raw_content_b64": base64.b64encode(data).decode("utf-8"),
                             "size": len(data),
                         }
-                        meta_results[f.name] = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+                        st.session_state.ocr_metadata[f.name] = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
                         done += 1
                         prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
                         st.write(f"`{f.name}` ready for RAG conversion")
@@ -605,29 +722,27 @@ def render_ocr_dashboard():
                             slots[n].markdown(f"`{n}` processing...")
                         with ThreadPoolExecutor(max_workers=BATCH_SIZE) as ex:
                             futs = {
-                                ex.submit(_ocr_file, n, d, t, f"{st.session_state.ocr_url}/v1/ocr", _headers(), params): n
+                                ex.submit(_submit_ocr_job, n, d, t, f"{st.session_state.ocr_url}/v1/ocr/jobs", _headers(), params): n
                                 for n, d, t in batch
                             }
                             for f in as_completed(futs):
                                 nm = futs[f]
-                                n, md, lat, tps, err = f.result()
+                                n, job, err = f.result()
                                 if err:
-                                    slots[nm].markdown(f"`{n}` failed: {err}")
+                                    slots[nm].markdown(f"`{n}` submission failed: {err}")
+                                    st.session_state.ocr_job_failures[n] = err
                                 else:
-                                    slots[nm].markdown(f"`{n}` done: {lat:.1f}s | {tps:.0f} tok/s")
-                                    results[n] = md
+                                    slots[nm].markdown(f"`{n}` queued for OCR")
+                                    st.session_state.ocr_jobs[n] = job
                                 done += 1
                                 prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
-                    if results:
-                        st.write("Auto-tagging...")
-                        for fname, md_text in results.items():
-                            meta_results[fname] = _autotag(fname, md_text, f"{st.session_state.rag_url}/v1/autotag", _headers())
-                    sb.update(label=f"Done: {len(results) + len(raw_documents)} files in {time.time() - t0:.1f}s", state="complete")
+                    sb.update(label=f"Submitted in {time.time() - t0:.1f}s", state="complete")
 
-                if results or raw_documents:
-                    st.session_state.ocr_results = results
-                    st.session_state.raw_documents = raw_documents
-                    st.session_state.ocr_metadata = meta_results
+                if st.session_state.ocr_jobs:
+                    st.rerun()
+                elif st.session_state.pending_raw_documents:
+                    st.session_state.raw_documents.update(st.session_state.pending_raw_documents)
+                    st.session_state.pending_raw_documents = {}
                     st.session_state.ocr_step = 2
                     st.session_state.uploader_key += 1
                     st.rerun()
@@ -661,6 +776,9 @@ def render_ocr_dashboard():
         if col_clr.button("Start new upload", use_container_width=True):
             st.session_state.ocr_results = {}
             st.session_state.raw_documents = {}
+            st.session_state.pending_raw_documents = {}
+            st.session_state.ocr_jobs = {}
+            st.session_state.ocr_job_failures = {}
             st.session_state.ocr_metadata = {}
             st.session_state.ocr_step = 1
             st.session_state.uploader_key += 1

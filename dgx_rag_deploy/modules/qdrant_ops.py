@@ -89,11 +89,15 @@ def tokenize_bm25(text: str) -> SparseVector:
         # Return a minimal sparse vector if no tokens
         return SparseVector(indices=[0], values=[0.0])
 
-    indices = []
-    values = []
+    # Sparse hashing can map distinct terms to the same Qdrant index. Merge
+    # their frequencies so every sparse vector index remains unique.
+    hashed_counts = Counter()
     for word, count in counts.items():
-        indices.append(mmh3.hash(word, signed=False) % (2 ** 20))
-        values.append(float(count))
+        index = mmh3.hash(word, signed=False) % (2 ** 20)
+        hashed_counts[index] += count
+
+    indices = sorted(hashed_counts)
+    values = [float(hashed_counts[index]) for index in indices]
     return SparseVector(indices=indices, values=values)
 
 

@@ -224,6 +224,7 @@ All settings in `.env`:
 | `CHAT_PORT` | `8003` | Chat server port |
 | `API_PORT` | `8081` | RAG FastAPI port |
 | `LIBREOFFICE_BIN` | `soffice` | LibreOffice executable for document conversion |
+| `RAG_UPSERT_BATCH_SIZE` | `64` | Maximum chunks embedded and written to Qdrant per ingestion batch; protects large documents from Qdrant request-size limits |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant address |
 | `API_KEYS` | (see .env.example) | Auth keys |
 

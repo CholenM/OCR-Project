@@ -75,6 +75,7 @@ CHAT_HISTORY_PATH = Path(os.getenv("CHAT_HISTORY_PATH", "chat_history.json"))
 
 RAG_CHUNK_SIZE    = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
 RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
+RAG_UPSERT_BATCH_SIZE = max(1, int(os.getenv("RAG_UPSERT_BATCH_SIZE", "64")))
 MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "3"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
 AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
@@ -433,17 +434,7 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
     chunks = chunk_markdown_structural(markdown_content, chunk_size)
     if not chunks:
         return {"status": "empty", "chunks": 0, "collection": collection, "filename": filename}
-
-    texts = [c["text"] for c in chunks]
-    embeddings = _embed_batch(texts)
-    if len(texts) != len(embeddings):
-        raise RuntimeError("Embedding count mismatch")
-
     client = _qclient()
-    ensure_collection(client, collection, len(embeddings[0]))
-
-    # Dedup: remove old chunks for this filename
-    delete_document_chunks(client, collection, filename)
 
     # Build metadata text for BM25 enrichment
     meta_text = filename
@@ -456,41 +447,85 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
 
     now = int(time.time())
     from qdrant_client.http.models import PointStruct
-    points = []
-    for i, (chunk_meta, vector) in enumerate(zip(chunks, embeddings)):
-        # BM25 indexes metadata + content, dense indexes only content
-        bm25_text = meta_text + " " + chunk_meta["text"]
-        sparse = tokenize_bm25(bm25_text)
-        points.append(PointStruct(
-            id=str(uuid.uuid4()),
-            vector={"dense": vector, "bm25": sparse},
-            payload={
-                "source": "ocr", "filename": filename, "chunk_index": i,
-                "text": chunk_meta["text"], "section": chunk_meta["section"],
-                "content_type": chunk_meta["content_type"], "created_at": now,
-                "metadata": metadata, "bm25_source": meta_text,
-            },
-        ))
+    total_batches = (len(chunks) + RAG_UPSERT_BATCH_SIZE - 1) // RAG_UPSERT_BATCH_SIZE
+    collection_ready = False
+    write_started = False
 
-    client.upsert(collection_name=collection, points=points)
+    try:
+        for batch_number, batch_start in enumerate(range(0, len(chunks), RAG_UPSERT_BATCH_SIZE), start=1):
+            chunk_batch = chunks[batch_start:batch_start + RAG_UPSERT_BATCH_SIZE]
+            texts = [chunk["text"] for chunk in chunk_batch]
+            embeddings = _embed_batch(texts)
+            if len(texts) != len(embeddings):
+                raise RuntimeError(
+                    f"Embedding count mismatch in batch {batch_number}/{total_batches}: "
+                    f"sent {len(texts)}, received {len(embeddings)}"
+                )
+
+            if not collection_ready:
+                ensure_collection(client, collection, len(embeddings[0]))
+                # Preserve replacement behavior, but only remove the existing document once
+                # the first embedding batch has succeeded.
+                delete_document_chunks(client, collection, filename)
+                collection_ready = True
+
+            points = []
+            for offset, (chunk_meta, vector) in enumerate(zip(chunk_batch, embeddings)):
+                chunk_index = batch_start + offset
+                bm25_text = meta_text + " " + chunk_meta["text"]
+                sparse = tokenize_bm25(bm25_text)
+                points.append(PointStruct(
+                    id=str(uuid.uuid4()),
+                    vector={"dense": vector, "bm25": sparse},
+                    payload={
+                        "source": "ocr", "filename": filename, "chunk_index": chunk_index,
+                        "text": chunk_meta["text"], "section": chunk_meta["section"],
+                        "content_type": chunk_meta["content_type"], "created_at": now,
+                        "metadata": metadata, "bm25_source": meta_text,
+                    },
+                ))
+
+            try:
+                client.upsert(collection_name=collection, points=points)
+                write_started = True
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Qdrant upsert failed for batch {batch_number}/{total_batches} "
+                    f"(chunks {batch_start}-{batch_start + len(chunk_batch) - 1}): {exc}"
+                ) from exc
+
+            log.info(
+                f"Ingesting {filename}: batch {batch_number}/{total_batches} | "
+                f"chunks {batch_start}-{batch_start + len(chunk_batch) - 1}"
+            )
+    except Exception:
+        if write_started:
+            delete_document_chunks(client, collection, filename)
+            log.warning(f"Ingest rollback: removed partial chunks for {filename}")
+        raise
+
     ensure_indexes(client, collection)
 
     db = API_KEY_DB.get(api_key)
     if db:
         db["metrics"]["total_ingestions"] += 1
-        db["metrics"]["total_chunks_ingested"] += len(points)
+        db["metrics"]["total_chunks_ingested"] += len(chunks)
         db["audit_logs"].append({
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "action": "ingest", "filename": filename, "chunks": len(points), "collection": collection,
+            "action": "ingest", "filename": filename, "chunks": len(chunks), "collection": collection,
+            "ingest_batches": total_batches,
         })
 
     sections_summary = {}
     for c in chunks:
         sections_summary[c["section"]] = sections_summary.get(c["section"], 0) + 1
 
-    log.info(f"Ingested: {filename} | {len(points)} chunks | meta: {metadata.get('doc_type', 'none')} | bm25_enriched")
-    return {"status": "ok", "chunks": len(points), "collection": collection,
-            "filename": filename, "sections": sections_summary, "metadata": metadata}
+    log.info(
+        f"Ingested: {filename} | {len(chunks)} chunks | {total_batches} batches | "
+        f"meta: {metadata.get('doc_type', 'none')} | bm25_enriched"
+    )
+    return {"status": "ok", "chunks": len(chunks), "ingest_batches": total_batches,
+            "collection": collection, "filename": filename, "sections": sections_summary, "metadata": metadata}
 
 
 def _attach_conversion_telemetry(result: dict, conversion) -> dict:
