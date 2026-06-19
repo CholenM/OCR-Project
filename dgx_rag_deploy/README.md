@@ -46,6 +46,21 @@ DGX Spark (192.168.50.153)
 
 ---
 
+## Supported Ingestion Formats
+
+The RAG API accepts Markdown directly, or base64-encoded source files through `raw_content_b64`.
+
+| Route | Extensions |
+|---|---|
+| Direct text/table conversion | `.md`, `.txt`, `.csv` |
+| Python-native extraction | `.docx`, `.dotx`, `.xls`, `.xlsx`, `.xlsm`, `.xlsb`, `.xlt` |
+| LibreOffice headless fallback | `.doc`, `.ppt`, `.pptx`, `.odt`, `.rtf`, plus Office formats when native extraction fails |
+| Existing OCR service | `.pdf`, `.jpg`, `.jpeg`, `.png` |
+
+LibreOffice is required for legacy Office, PowerPoint, OpenDocument, and RTF conversion. `setup.sh` installs/checks it on DGX Linux; set `LIBREOFFICE_BIN` in `.env` if the binary is not named `soffice`.
+
+---
+
 ## Setup Guide
 
 ### Step 1: Transfer to DGX Spark
@@ -67,6 +82,7 @@ This will:
 - Download Qwen3-Embedding-8B-Q4_K_M.gguf (~5 GB)
 - Download Qwen3.6-35B-A3B-Uncensored-Q4_K_M.gguf (~14 GB)
 - Start Qdrant Docker container
+- Check/install LibreOffice for Office/OpenDocument/RTF conversion
 - Create Python venv
 - Generate `.env` with correct llama-server path
 
@@ -114,10 +130,33 @@ curl -X POST http://192.168.50.153:8081/v1/ingest \
 | Param | Default | Description |
 |---|---|---|
 | `filename` | required | Source document name |
-| `markdown_content` | required | Text to chunk and embed |
+| `markdown_content` | optional | Text to chunk and embed |
+| `raw_content_b64` | optional | Base64 file bytes for supported document formats |
 | `collection` | ocr_rag | Qdrant collection |
 | `chunk_size` | 1200 | Characters per chunk |
 | `chunk_overlap` | 150 | Overlap between chunks |
+
+Example for a DOCX/RTF/Excel/PowerPoint-style file:
+
+```bash
+python - <<'PY'
+import base64, requests
+
+path = "contract.docx"
+payload = {
+    "filename": path,
+    "raw_content_b64": base64.b64encode(open(path, "rb").read()).decode("utf-8"),
+    "collection": "ocr_rag",
+}
+r = requests.post(
+    "http://192.168.50.153:8081/v1/ingest",
+    headers={"X-API-KEY": "test_key_0000"},
+    json=payload,
+    timeout=300,
+)
+print(r.status_code, r.json())
+PY
+```
 
 ### `POST /v1/chat` — Query ingested documents
 
@@ -184,6 +223,7 @@ All settings in `.env`:
 | `CHAT_MODEL_PATH` | `./models/Qwen3.6-...Q4_K_M.gguf` | Chat LLM |
 | `CHAT_PORT` | `8003` | Chat server port |
 | `API_PORT` | `8081` | RAG FastAPI port |
+| `LIBREOFFICE_BIN` | `soffice` | LibreOffice executable for document conversion |
 | `QDRANT_URL` | `http://localhost:6333` | Qdrant address |
 | `API_KEYS` | (see .env.example) | Auth keys |
 

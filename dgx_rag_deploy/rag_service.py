@@ -15,14 +15,17 @@ Endpoints:
   GET    /v1/metadata/{c}/{f}  — Get document metadata
   PATCH  /v1/metadata/{c}/{f}  — Update metadata (no re-embed)
   GET    /v1/documents/{c}     — List documents in collection
+  GET    /v1/chat/history/{sid} — List persisted visible chat history
+  DELETE /v1/chat/history/{sid} — Clear persisted visible chat history
   GET    /v1/memory/{sid}      — List session memories
   DELETE /v1/memory/{sid}      — Clear session memory
   GET    /v1/metrics           — Usage telemetry
   GET    /healthz              — Health check
 """
 
-import os, re, time, uuid, json, logging, hashlib, asyncio
+import os, re, time, uuid, json, logging, hashlib, asyncio, threading
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from dotenv import load_dotenv
@@ -34,6 +37,7 @@ import httpx
 
 from modules.embedder import embed_batch, embed_single
 from modules.chunker import chunk_markdown_structural
+from modules.document_converter import ConversionError, convert_to_markdown
 from modules.retriever import retrieve, plan_query, build_context
 from modules.reranker import rerank_with_server, rerank_with_llm
 from modules.memory import (
@@ -58,6 +62,7 @@ log = logging.getLogger("rag-pipeline")
 EMBED_MODEL_URL  = os.getenv("EMBED_MODEL_URL", "http://127.0.0.1:8002/v1/embeddings")
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "Qwen3-Embedding-8B")
 EMBED_API_KEY    = os.getenv("EMBED_API_KEY", "sk-embed-layer2")
+EMBED_VECTOR_SIZE = os.getenv("EMBED_VECTOR_SIZE")
 
 CHAT_MODEL_URL  = os.getenv("CHAT_MODEL_URL", "http://127.0.0.1:8003/v1/chat/completions")
 CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", "Qwen3.6-35B-A3B")
@@ -66,6 +71,7 @@ CHAT_API_KEY    = os.getenv("CHAT_API_KEY", "sk-chat-layer3")
 QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "ocr_rag")
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chat_memory")
+CHAT_HISTORY_PATH = Path(os.getenv("CHAT_HISTORY_PATH", "chat_history.json"))
 
 RAG_CHUNK_SIZE    = int(os.getenv("RAG_CHUNK_SIZE", "1200"))
 RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
@@ -82,6 +88,8 @@ RERANKER_API_KEY  = os.getenv("RERANKER_API_KEY", "sk-rerank-layer4")
 # Response cache (TTL-based)
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
 _response_cache: Dict[str, dict] = {}
+_embed_dim_cache: Optional[int] = None
+_chat_history_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # API Key DB
@@ -128,6 +136,72 @@ def _embed(text):
 
 def _embed_batch(texts):
     return embed_batch(texts, EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY)
+
+
+def _embedding_dim() -> int:
+    """Return embedding width for creating empty session collections."""
+    global _embed_dim_cache
+    if _embed_dim_cache:
+        return _embed_dim_cache
+    if EMBED_VECTOR_SIZE:
+        _embed_dim_cache = int(EMBED_VECTOR_SIZE)
+        return _embed_dim_cache
+    probe = _embed("dimension probe")
+    _embed_dim_cache = len(probe)
+    return _embed_dim_cache
+
+
+def _read_chat_history() -> Dict[str, List[dict]]:
+    if not CHAT_HISTORY_PATH.exists():
+        return {}
+    try:
+        with CHAT_HISTORY_PATH.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        log.warning(f"Chat history read failed: {e}")
+        return {}
+
+
+def _write_chat_history(data: Dict[str, List[dict]]):
+    CHAT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CHAT_HISTORY_PATH.with_suffix(CHAT_HISTORY_PATH.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8") as fh:
+        json.dump(data, fh, ensure_ascii=False, indent=2)
+    tmp_path.replace(CHAT_HISTORY_PATH)
+
+
+def _append_chat_turn(session_id: Optional[str], query: str, answer: str, sources=None, memories=None, latency=None):
+    if not session_id:
+        return
+    now = int(time.time())
+    with _chat_history_lock:
+        data = _read_chat_history()
+        messages = data.setdefault(session_id, [])
+        messages.append({"role": "user", "content": query, "ts": now})
+        messages.append({
+            "role": "assistant",
+            "content": answer,
+            "sources": sources or [],
+            "memories": memories or [],
+            "latency": latency,
+            "ts": int(time.time()),
+        })
+        _write_chat_history(data)
+
+
+def _get_chat_history(session_id: str) -> List[dict]:
+    with _chat_history_lock:
+        return _read_chat_history().get(session_id, [])
+
+
+def _clear_chat_history(session_id: str) -> int:
+    with _chat_history_lock:
+        data = _read_chat_history()
+        count = len(data.get(session_id, []))
+        data[session_id] = []
+        _write_chat_history(data)
+        return count
 
 def _chat(messages, temperature=0.7):
     r = requests.post(CHAT_MODEL_URL, json={"model": CHAT_MODEL_NAME, "messages": messages, "temperature": temperature},
@@ -188,77 +262,6 @@ def _do_rerank(query: str, sources: list) -> list:
         return rerank_with_llm(query, sources, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY)
 
 # ===========================================================================
-# File Format Converters (DOCX, TXT, CSV → Markdown)
-# ===========================================================================
-def _convert_to_markdown(filename: str, content_bytes: bytes) -> Optional[str]:
-    """Convert DOCX/TXT/CSV bytes to markdown string. Returns None if unsupported."""
-    ext = os.path.splitext(filename)[1].lower()
-
-    if ext == ".txt":
-        return content_bytes.decode("utf-8", errors="replace")
-
-    if ext == ".csv":
-        text = content_bytes.decode("utf-8", errors="replace")
-        lines = text.strip().split("\n")
-        if not lines:
-            return ""
-        import csv, io
-        reader = csv.reader(io.StringIO(text))
-        rows = list(reader)
-        if not rows:
-            return ""
-        # Build markdown table
-        header = rows[0]
-        md = "| " + " | ".join(header) + " |\n"
-        md += "| " + " | ".join(["---"] * len(header)) + " |\n"
-        for row in rows[1:]:
-            # Pad/truncate to header length
-            padded = row + [""] * (len(header) - len(row))
-            md += "| " + " | ".join(padded[:len(header)]) + " |\n"
-        return md
-
-    if ext == ".docx":
-        try:
-            import docx
-            import io as _io
-            doc = docx.Document(_io.BytesIO(content_bytes))
-            parts = []
-            for para in doc.paragraphs:
-                text = para.text.strip()
-                if not text:
-                    continue
-                style = (para.style.name or "").lower()
-                if "heading 1" in style:
-                    parts.append(f"# {text}")
-                elif "heading 2" in style:
-                    parts.append(f"## {text}")
-                elif "heading 3" in style:
-                    parts.append(f"### {text}")
-                elif "heading" in style:
-                    parts.append(f"#### {text}")
-                else:
-                    parts.append(text)
-            # Handle tables
-            for table in doc.tables:
-                rows = []
-                for row in table.rows:
-                    cells = [cell.text.strip() for cell in row.cells]
-                    rows.append(cells)
-                if rows:
-                    md_table = "| " + " | ".join(rows[0]) + " |\n"
-                    md_table += "| " + " | ".join(["---"] * len(rows[0])) + " |\n"
-                    for r in rows[1:]:
-                        padded = r + [""] * (len(rows[0]) - len(r))
-                        md_table += "| " + " | ".join(padded[:len(rows[0])]) + " |\n"
-                    parts.append(md_table)
-            return "\n\n".join(parts)
-        except ImportError:
-            log.warning("python-docx not installed — DOCX support unavailable")
-            return None
-
-    return None  # Unsupported format
-
-# ===========================================================================
 # Endpoints: Sessions
 # ===========================================================================
 @app.post("/v1/sessions", tags=["Sessions"])
@@ -274,6 +277,8 @@ async def create_session(
     existing = {c.name for c in client.get_collections().collections}
     if clean in existing:
         return {"status": "exists", "session": clean}
+    ensure_collection(client, clean, _embedding_dim())
+    ensure_indexes(client, clean)
     log.info(f"Session created: {clean}")
     return {"status": "created", "session": clean, "description": description}
 
@@ -318,8 +323,9 @@ async def delete_session(name: str, api_key: str = Depends(verify_api_key)):
     if name in existing:
         client.delete_collection(name)
     cleared = clear_session_memory(client, MEMORY_COLLECTION, name)
-    log.info(f"Session deleted: {name} (memory cleared: {cleared})")
-    return {"status": "deleted", "session": name, "memory_cleared": cleared}
+    history_cleared = _clear_chat_history(name)
+    log.info(f"Session deleted: {name} (memory cleared: {cleared}, history cleared: {history_cleared})")
+    return {"status": "deleted", "session": name, "memory_cleared": cleared, "history_cleared": history_cleared}
 
 # ===========================================================================
 # Endpoints: Health
@@ -487,34 +493,48 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
             "filename": filename, "sections": sections_summary, "metadata": metadata}
 
 
+def _attach_conversion_telemetry(result: dict, conversion) -> dict:
+    if conversion:
+        result["conversion_strategy"] = conversion.strategy
+        result["source_ext"] = conversion.source_ext
+        result["conversion_warnings"] = conversion.warnings
+    return result
+
+
 @app.post("/v1/ingest", tags=["RAG"])
 async def ingest_document(
     api_key: str = Depends(verify_api_key),
     filename: str = Body(..., embed=True),
     markdown_content: str = Body(None, embed=True),
-    raw_content_b64: str = Body(None, embed=True, description="Base64-encoded DOCX/TXT/CSV file"),
+    raw_content_b64: str = Body(None, embed=True, description="Base64-encoded supported document file"),
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
     metadata: dict = Body(None, embed=True),
 ):
-    """Ingest a document. Supports markdown directly, or DOCX/TXT/CSV via raw_content_b64."""
+    """Ingest a document. Supports markdown directly, or supported files via raw_content_b64."""
     collection = collection or QDRANT_COLLECTION
     chunk_size = chunk_size or RAG_CHUNK_SIZE
     metadata = metadata or {}
+    conversion = None
 
     # Handle non-markdown file formats
     if not markdown_content and raw_content_b64:
         import base64
-        raw_bytes = base64.b64decode(raw_content_b64)
-        markdown_content = _convert_to_markdown(filename, raw_bytes)
-        if markdown_content is None:
-            raise HTTPException(status_code=400, detail=f"Unsupported file format: {filename}")
+        try:
+            raw_bytes = base64.b64decode(raw_content_b64)
+            conversion = convert_to_markdown(filename, raw_bytes)
+            markdown_content = conversion.markdown
+        except ConversionError as e:
+            raise HTTPException(status_code=e.status_code, detail={"error": str(e), "warnings": e.warnings})
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=f"Document conversion failed: {str(e)}")
 
     if not markdown_content:
         raise HTTPException(status_code=400, detail="No content provided (markdown_content or raw_content_b64 required)")
 
     try:
-        return _do_ingest(filename, markdown_content, collection, chunk_size, metadata, api_key)
+        result = _do_ingest(filename, markdown_content, collection, chunk_size, metadata, api_key)
+        return _attach_conversion_telemetry(result, conversion)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
 
@@ -522,7 +542,7 @@ async def ingest_document(
 @app.post("/v1/ingest/batch", tags=["RAG"])
 async def ingest_batch(
     api_key: str = Depends(verify_api_key),
-    documents: List[dict] = Body(..., embed=True, description="List of {filename, markdown_content, metadata?}"),
+    documents: List[dict] = Body(..., embed=True, description="List of {filename, markdown_content or raw_content_b64, metadata?}"),
     collection: str = Body(None, embed=True),
     chunk_size: int = Body(None, embed=True),
 ):
@@ -537,9 +557,19 @@ async def ingest_batch(
             fname = doc.get("filename", "unknown")
             content = doc.get("markdown_content", "")
             meta = doc.get("metadata", {})
+            conversion = None
             try:
+                if not content and doc.get("raw_content_b64"):
+                    import base64
+                    raw_bytes = base64.b64decode(doc["raw_content_b64"])
+                    conversion = convert_to_markdown(fname, raw_bytes)
+                    content = conversion.markdown
+                if not content:
+                    return {"status": "error", "filename": fname, "error": "No content provided"}
                 r = await asyncio.to_thread(_do_ingest, fname, content, collection, chunk_size, meta, api_key)
-                return r
+                return _attach_conversion_telemetry(r, conversion)
+            except ConversionError as e:
+                return {"status": "error", "filename": fname, "error": str(e), "warnings": e.warnings}
             except Exception as e:
                 return {"status": "error", "filename": fname, "error": str(e)}
 
@@ -666,6 +696,7 @@ async def chat_with_documents(
 
         log.info(f"Chat: '{query[:50]}...' | {len(sources)} docs | {len(memories)} mem | {latency}s")
         result = {"answer": answer, "sources": sources, "memories": memories, "latency": latency}
+        _append_chat_turn(session_id, query, answer, sources, memories, latency)
 
         # Cache stateless responses
         if cache_k:
@@ -729,7 +760,10 @@ async def chat_stream(
                 memories = search_memory(client, MEMORY_COLLECTION, session_id, query_vector, memory_top_k)
 
             if not sources and not memories:
-                yield f"data: {json.dumps({'type': 'complete', 'answer': 'No relevant information found.', 'sources': [], 'memories': [], 'latency': round(time.time() - t0, 2)})}\n\n"
+                latency = round(time.time() - t0, 2)
+                answer = "No relevant information found."
+                _append_chat_turn(session_id, query, answer, [], [], latency)
+                yield f"data: {json.dumps({'type': 'complete', 'answer': answer, 'sources': [], 'memories': [], 'latency': latency})}\n\n"
                 return
 
             context, sources = build_context(sources, memories, MAX_CONTEXT_TOKENS)
@@ -815,6 +849,8 @@ async def chat_stream(
                 )
 
             latency = round(time.time() - t0, 2)
+            visible_answer = clean_answer.strip() or full_answer
+            _append_chat_turn(session_id, query, visible_answer, sources, memories, latency)
             yield f"data: {json.dumps({'type': 'complete', 'latency': latency})}\n\n"
             log.info(f"Stream: '{query[:50]}...' | {len(sources)} docs | {latency}s")
 
@@ -822,6 +858,21 @@ async def chat_stream(
             yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
+
+# ===========================================================================
+# Endpoints: Visible Chat History
+# ===========================================================================
+@app.get("/v1/chat/history/{session_id}", tags=["Chat History"])
+async def get_chat_history(session_id: str, api_key: str = Depends(verify_api_key)):
+    messages = _get_chat_history(session_id)
+    return {"session_id": session_id, "messages": messages, "count": len(messages)}
+
+
+@app.delete("/v1/chat/history/{session_id}", tags=["Chat History"])
+async def delete_chat_history(session_id: str, api_key: str = Depends(verify_api_key)):
+    count = _clear_chat_history(session_id)
+    log.info(f"Cleared {count} visible chat messages for {session_id}")
+    return {"session_id": session_id, "cleared": count}
 
 # ===========================================================================
 # Endpoints: Memory

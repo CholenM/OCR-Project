@@ -3,7 +3,7 @@ Watch Daemon — Auto-Ingest Folder Monitor
 ==========================================
 Monitors a folder for new files and automatically:
   - PDFs/Images → OCR → Auto-tag → Ingest
-  - DOCX/TXT/CSV → Convert → Auto-tag → Ingest
+  - Office/OpenDocument/RTF/TXT/CSV → Convert → Ingest
   - .md files → Auto-tag → Ingest directly
 
 Moves processed files to a 'processed/' subfolder.
@@ -53,7 +53,12 @@ API_KEY     = os.getenv("WATCH_API_KEY", os.getenv("API_KEYS", "test_key_0000").
 
 # Supported file extensions
 OCR_EXTENSIONS = {".pdf", ".jpg", ".jpeg", ".png"}
-DIRECT_EXTENSIONS = {".md", ".txt", ".csv", ".docx"}
+DIRECT_EXTENSIONS = {
+    ".md", ".txt", ".csv",
+    ".docx", ".doc", ".dotx", ".odt", ".rtf",
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt",
+    ".ppt", ".pptx",
+}
 ALL_EXTENSIONS = OCR_EXTENSIONS | DIRECT_EXTENSIONS
 
 
@@ -88,7 +93,7 @@ def _process_ocr_file(filepath: Path) -> dict:
 
 
 def _process_direct_file(filepath: Path) -> dict:
-    """Process .md, .txt, .csv, .docx files directly (no OCR needed)."""
+    """Process supported non-OCR files directly through the RAG converter."""
     log.info(f"Direct processing: {filepath.name}")
     ext = filepath.suffix.lower()
 

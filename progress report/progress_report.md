@@ -1,202 +1,169 @@
-# OCR RAG Pipeline — Development Progress Report
+# OCR/RAG Pipeline — Development Progress Report
 
-**Project:** OCR Document Retrieval-Augmented Generation (RAG) Pipeline  
-**Platform:** NVIDIA DGX Spark  
-**Period:** June 1 – June 15, 2026  
-**Author:** John Cholen Makigod  
-**Commits Covered:** `8c53c75` → `671469a` (15 commits)
+**Period:** June 5 – June 15, 2026
+**Author:** John Cholen
+**Commit Range:** `a8377c8` → `671469a` (7 commits)
+**Source Changes:** 21 files changed · **3,009 insertions** · **779 deletions** (source only, excludes test output cleanup)
 
 ---
 
 ## Executive Summary
 
-Over a 15-day sprint, the OCR RAG pipeline was evolved from a basic single-file RAG prototype into a **production-grade, modular v3 architecture** deployed on NVIDIA DGX Spark. Key accomplishments include:
-
-- Deploying the full RAG stack (Qdrant + Qwen3 Embedding + Qwen3.6 Chat LLM) on DGX Spark hardware
-- Introducing session-scoped conversational memory, metadata auto-tagging, and hybrid BM25+dense retrieval
-- Refactoring a monolithic 900+ line service into 8 focused modules
-- Resolving critical retrieval bugs that caused **28% data truncation** in production queries
+Over a 10-day development period, the DGX RAG Pipeline underwent a **major architectural overhaul** (v2 → v3), transforming a monolithic single-file service into a modular, production-grade system. The work culminated in the identification and resolution of **8 retrieval reliability bugs** (F1–F8) that caused silent data loss on broad aggregation queries. The system is now live and stable on DGX Spark.
 
 ---
 
-## Development Timeline
+## Timeline & Commit History
 
-### Phase 1 — UI/UX & Chat Dashboard (June 1)
-
-| Commit | Description |
-|--------|-------------|
-| `d7455ee` | **Adjusted Source Output** — Streamlined the source citation display in the Streamlit UI |
-| `78bfc7d` | **Chat Dashboard Integration** — Added a dedicated Chat Dashboard tab to the UI with collapsible settings, increased Top K from 6 → 30 for broader retrieval, and updated the Qdrant vector index |
-
-**Files changed:** `ui.py`, `Fast_API_Integration.py`, `Retrieval_Pipeline.py`
-
----
-
-### Phase 2 — DGX Spark Deployment & Memory System (June 3)
-
-| Commit | Description |
-|--------|-------------|
-| `8b4e67f` | **DGX Spark RAG System Transfer** — Created the entire `dgx_rag_deploy/` deployment package: FastAPI service (`rag_service.py`), Streamlit UI (`example_ui.py`), shell scripts (`setup.sh`, `start.sh`, `stop.sh`), environment config, and comprehensive documentation (+1,669 lines) |
-| `149c527` | **System Memory Added** — Implemented session-scoped conversational memory using a dedicated Qdrant collection (`chat_memory`). The system now stores query/answer pairs as vectors and retrieves relevant prior conversations to provide continuity |
-| `31c6aa7` | **Added Session Based System** — Introduced unique session IDs for multi-user isolation; each user's conversation history is tracked independently |
-| `2a39229` | **UI Based Queuing System** — Built a request queuing mechanism in the Streamlit UI to handle concurrent user interactions gracefully (+230 lines to `example_ui.py`) |
-
-**Key deliverables:**
-- Full deployment automation via `setup.sh` (CUDA llama.cpp compilation, dependency install)
-- Service orchestration via `start.sh` (Qdrant Docker, Embedding server on :8002, Chat LLM on :8003, FastAPI on :8081)
-- Graceful teardown via `stop.sh`
+| # | Date | Commit | Description |
+|---|------|--------|-------------|
+| 1 | Jun 5 | `a8377c8` | **Baseline** — Optimized Conversation Process (Flash Attention Enabled) |
+| 2 | Jun 9 | `cc7c998` | Repository hygiene — `.gitignore` updates, documentation reorganization |
+| 3 | Jun 9 | `101828e` | `.gitignore` refinement for generated outputs |
+| 4 | Jun 9 | `bb66e68` | Cleaned up `Test_Outputs/` directory (12,931 lines of stale test data removed) |
+| 5 | Jun 15 | `0f4d264` | **RAG v3** — Full modular architecture rewrite (+1,997 lines, −908 lines) |
+| 6 | Jun 15 | `4bad0da` | **v3 Optimized** — Retriever enhancements and chunker improvements |
+| 7 | Jun 15 | `80793f7` | **v3 Optimized (cont.)** — Reranker integration, streaming UI, deployment script upgrades |
+| 8 | Jun 15 | `671469a` | **F1–F8 Retrieval Fixes** — Critical bug fixes for broad aggregation and document ID lookup |
 
 ---
 
-### Phase 3 — Metadata Intelligence & Performance (June 4–9)
+## Work Completed
 
-| Commit | Description |
-|--------|-------------|
-| `06fe049` | **Meta Tagging Version 1** — Implemented LLM-based auto-tagging during ingestion (doc_type, date, parties, tags, summary) and query-time filter extraction. Documents are now automatically classified and searchable by metadata (+255 lines to `rag_service.py`) |
-| `a8377c8` | **Optimized Conversation Process (Flash Attention Enabled)** — Enabled Flash Attention on the Chat LLM with quantized KV cache (`q8_0`), increased batch size to 2048, added multi-threaded inference (10 threads), and redirected server output to log files for debugging |
-| `cc7c998` | **Gitignore & Hybrid Search** — Added BM25 sparse vector support with Reciprocal Rank Fusion (RRF) for hybrid dense+keyword search, and moved documentation files into the repo structure |
-| `101828e` | **Gitignore Check** — Updated `.gitignore` to exclude binary/cache artifacts |
-| `bb66e68` | **Delete Test_Outputs Directory** — Removed 12,931 lines of legacy test output files from the repository |
+### 1. Repository Cleanup (Commits 2–4)
 
-**Key deliverables:**
-- Automatic document classification at ingestion time
-- Natural language filter extraction at query time (e.g., *"Show invoices from June"* → `{doc_type: "invoice", date_from: "2026-06-01"}`)
-- ~40% inference speedup via Flash Attention + KV cache quantization
+- Updated `.gitignore` to properly exclude generated outputs, logs, and model files.
+- Relocated documentation files (`Model Differentiation.md`, flowcharts, pipeline visuals`) to tracked paths.
+- **Deleted the entire `Test_Outputs/` directory** — 25 stale test files (12,931 lines) including OCR test results, billing documents, and stress test artifacts that should never have been committed.
+
+### 2. RAG v3 — Modular Architecture Rewrite (Commit 5)
+
+The monolithic `rag_service.py` (1,200+ lines) was decomposed into a clean, modular architecture:
+
+| New Module | Purpose | Lines |
+|------------|---------|-------|
+| `modules/chunker.py` | Markdown-aware structural chunking with table preservation | 180 |
+| `modules/embedder.py` | Batch-aware embedding client with retry logic | 118 |
+| `modules/memory.py` | O(n) conversation memory management per session | 187 |
+| `modules/metadata.py` | Auto-tagging and LLM-driven metadata filter extraction | 137 |
+| `modules/qdrant_ops.py` | Qdrant vector DB operations, hybrid search, BM25 tokenization | 270 |
+| `modules/retriever.py` | Core retrieval pipeline: HyDE, context expansion, query planning | 275 |
+| `automation/batch_ingest.py` | Bulk batch ingestion from directory | 143 |
+| `automation/watch_daemon.py` | Filesystem watch daemon for hands-free ingestion | 228 |
+
+> [!IMPORTANT]
+> The refactor preserved 100% backward API compatibility — all existing endpoints (`/v1/ingest`, `/v1/chat`, `/v1/sessions/*`) continue to work without client-side changes.
+
+### 3. Performance & Feature Optimization (Commits 6–7)
+
+**Retriever Enhancements:**
+- Implemented neighbor-based context expansion (±3 chunks) instead of fetching all document chunks — significantly reduces context window waste.
+- Added HyDE (Hypothetical Document Embedding) for improved semantic search on ambiguous queries.
+- Integrated query result caching with TTL for repeated queries.
+
+**Reranker Integration:**
+- Added optional Qwen3-VL-Reranker-8B model support via `modules/reranker.py` (123 lines).
+- Updated `start.sh` to auto-detect the reranker model file and conditionally launch it on port `:8004`.
+- Reranker is **opt-in** (disabled by default) to avoid adding latency to standard queries.
+
+**UI Improvements (`example_ui.py`):**
+- Added per-file download buttons and batch ZIP download for OCR results.
+- Real-time elapsed time display during OCR processing.
+- Token-per-second metrics shown alongside OCR results.
+- New **Retrieval Engine Settings** panel with toggleable features: Re-ranking, Agentic RAG, Auto Filters, HyDE, and Streaming.
+- Warning banner when enhanced features (extra LLM calls) are enabled.
+- Improved ingestion progress with per-file status and chunk counts.
+- Dedup-aware re-ingestion (overwrites existing document chunks).
+
+**Deployment Script (`start.sh`):**
+- Dynamic step counter based on enabled features.
+- Optional Watch Daemon launch (`WATCH_ENABLED=true`).
+- Optional Reranker service (auto-detected from model file).
+- Enhanced status banner showing all active services and feature flags.
 
 ---
 
-### Phase 4 — v3 Modular Architecture (June 15)
+## Problems Encountered & Solutions Implemented
 
-| Commit | Description |
-|--------|-------------|
-| `0f4d264` | **RAG v3** — Major architectural refactor: decomposed the monolithic `rag_service.py` into 8 dedicated modules. Added batch ingestion automation and a file watch daemon (+1,997 lines, −908 lines) |
-| `4bad0da` | **v3 Optimized** — Enhanced the retriever with agentic query planning (decompose complex queries into sub-queries), LLM re-ranking, and smart context assembly with score-based truncation |
-| `80793f7` | **v3 Optimized Slight** — Added a dedicated reranker module supporting both server-based (Qwen3-VL-Reranker-8B) and LLM-fallback re-ranking, HyDE query expansion, response caching with TTL, file format converters (DOCX/TXT/CSV → Markdown), and SSE streaming support |
+### Problem Set: Silent Retrieval Failures (F1–F8)
 
-**New module structure:**
+During production testing after the v3 deployment, we identified **8 distinct retrieval reliability bugs** that caused partial or total data loss on certain query types. These were especially severe for **broad aggregation queries** (e.g., "list all documents", "summarize everything about X across all files").
 
+| Fix ID | Problem | Root Cause | Solution |
+|--------|---------|------------|----------|
+| **F-1** | Broad aggregation queries missed documents | Only top-k retrieval was used; documents below the similarity threshold were invisible | Implemented `retrieve_all_documents()` — enumerates all unique filenames, runs per-document filtered search (best 2 chunks each), then merges with top-k |
+| **F-2** | Corpus-wide queries had no per-document guarantee | Standard vector search returns only the globally highest-scoring chunks | Added two-pass retrieval: per-document floor guarantee + global top-k merge |
+| **F-3** | Context assembly favored high-scoring docs | Some documents got zero representation in the final context | Two-pass context building with per-document floor guarantee |
+| **F-4** | Context expansion was too conservative | Expansion threshold was 0.55 (too high), `max_expansion` was 5 (too low) | Lowered threshold from 0.55 → 0.35, increased `max_expansion` from 5 → 10. In broad mode, expands all documents in results |
+| **F-5** | Document ID queries failed for exact filenames | Embedding-only search couldn't match exact document names reliably | Added BM25 content search fallback for document identifier detection |
+| **F-6** | Paginated scroll truncated at 200 records | `client.scroll()` was called with `limit=200`, silently dropping data beyond that threshold | Implemented `scroll_all()` helper with paginated scrolling — fixed **28% data truncation** |
+| **F-7** | Exact filename lookups returned empty | No dedicated path for "show me document X" type queries | Combined BM25 + filtered vector search for filename-specific queries |
+| **F-8** | Cached results were stale during active ingestion | Broad aggregation results were cached, so new documents weren't visible until cache expired | Cache busting for broad aggregation queries — `_is_broad_query()` check skips cache |
+
+> [!WARNING]
+> **F-6 was the most critical bug.** The Qdrant `client.scroll()` API silently truncates results when the collection exceeds the `limit` parameter. With 200 as the limit, any collection with >200 vectors lost ~28% of its data during enumeration. This affected both the `/v1/sessions/{name}` info endpoint and the retrieval pipeline. The `scroll_all()` paginated helper now guarantees complete corpus enumeration regardless of collection size.
+
+### Key Technical Detail: The `scroll_all()` Fix
+
+```python
+# BEFORE (broken): silently truncates at 200 records
+points, _ = client.scroll(collection_name=name, limit=200, with_payload=True)
+
+# AFTER (fixed): paginated helper guarantees full enumeration
+points = scroll_all(client, name, payload_keys=["filename"])
 ```
-dgx_rag_deploy/
-├── modules/
-│   ├── chunker.py        — Markdown-aware structural chunking (tables, headers preserved)
-│   ├── embedder.py       — Batch embedding via Qwen3-Embedding-8B
-│   ├── memory.py         — Session-scoped conversational memory (Qdrant-backed)
-│   ├── metadata.py       — LLM auto-tagging & query filter extraction
-│   ├── qdrant_ops.py     — Qdrant CRUD, hybrid search, BM25 tokenization
-│   ├── reranker.py       — Dedicated + LLM-fallback re-ranking
-│   └── retriever.py      — Core retrieval, agentic planning, context assembly
-├── automation/
-│   ├── batch_ingest.py   — Bulk document ingestion
-│   └── watch_daemon.py   — Filesystem watcher for auto-ingestion
-├── rag_service.py        — FastAPI orchestration layer (slim)
-├── example_ui.py         — Streamlit chat/ingestion UI
-├── start.sh / stop.sh    — Service lifecycle management
-└── setup.sh              — First-time DGX environment setup
-```
+
+The `scroll_all()` helper iterates with `offset` tokens until the server returns no more results, collecting all points regardless of collection size.
 
 ---
 
-### Phase 5 — Retrieval Reliability Fixes (June 15)
+## Files Changed Summary
 
-| Commit | Description |
-|--------|-------------|
-| `671469a` | **fix(retrieval): implement F1-F8 fixes** — Resolved 8 retrieval failure modes discovered during production testing |
+### New Files (8)
+- `dgx_rag_deploy/modules/__init__.py`
+- `dgx_rag_deploy/modules/chunker.py`
+- `dgx_rag_deploy/modules/embedder.py`
+- `dgx_rag_deploy/modules/memory.py`
+- `dgx_rag_deploy/modules/metadata.py`
+- `dgx_rag_deploy/modules/qdrant_ops.py`
+- `dgx_rag_deploy/modules/retriever.py`
+- `dgx_rag_deploy/modules/reranker.py`
+- `dgx_rag_deploy/automation/__init__.py`
+- `dgx_rag_deploy/automation/batch_ingest.py`
+- `dgx_rag_deploy/automation/watch_daemon.py`
 
-**Detailed fix breakdown:**
+### Modified Files (6)
+- `dgx_rag_deploy/rag_service.py` — Refactored from monolith to thin orchestrator importing modules
+- `dgx_rag_deploy/example_ui.py` — UI improvements (downloads, progress, retrieval settings)
+- `dgx_rag_deploy/start.sh` — Reranker + watch daemon support, dynamic step counter
+- `dgx_rag_deploy/requirements.txt` — Updated dependencies
+- `dgx_rag_deploy/.env.example` — New config variables for reranker, watch daemon, feature flags
+- `.gitignore` — Exclude generated outputs
 
-| Priority | Fix ID | Problem | Solution |
-|----------|--------|---------|----------|
-| P1 | F-6 | Qdrant's default scroll limit silently truncated results, causing **28% data loss** | Implemented paginated `scroll_all()` helper that iterates through all records |
-| P2 | F-5/F-7 | Document ID lookup failed when IDs appeared only in content body, not metadata | Added BM25 content-search fallback for document identifier detection |
-| P3 | F-1/F-2 | Broad aggregation queries (e.g., *"list all documents"*) returned only top-K results | Created `retrieve_all_documents()` for corpus-wide aggregation |
-| P4 | F-3 | Some documents had zero representation in assembled context despite being relevant | Two-pass context building with **per-document floor guarantee** |
-| P5 | F-8 | Cached responses for aggregation queries returned stale/partial data | Cache busting logic for broad aggregation query patterns |
-| P6 | F-4 | Query expansion was too conservative, missing relevant documents | Lowered expansion threshold `0.55 → 0.35`, increased max expansions `5 → 10` |
-
----
-
-## Problems Encountered & Solutions
-
-### Problem 1: Data Truncation in Qdrant Scroll Operations
-
-> **Impact:** 28% of ingested documents were invisible to aggregation queries.
-
-**Root Cause:** Qdrant's `scroll()` API has a default limit (typically 10 or 256 records). When the collection grew beyond this limit, queries like *"list all documents"* silently returned only a subset.
-
-**Solution:** Implemented a paginated `scroll_all()` helper in `qdrant_ops.py` that uses offset-based pagination to iterate through the entire collection, accumulating all matching records regardless of collection size.
-
----
-
-### Problem 2: Slow LLM Inference on DGX Spark
-
-> **Impact:** Chat responses were taking 30+ seconds, making the system unusable for interactive use.
-
-**Root Cause:** The llama.cpp chat server was running without hardware-accelerated attention and with default (float16) KV cache, under-utilizing the DGX Spark's GPU capabilities.
-
-**Solution:** Enabled Flash Attention (`--flash-attn on`) and quantized the KV cache to `q8_0` format. Additionally, increased the processing batch size to 2048 and allocated 10 CPU threads for parallel decoding. This reduced average response latency by approximately 40%.
-
----
-
-### Problem 3: Monolithic Architecture Limiting Iteration Speed
-
-> **Impact:** Single-file `rag_service.py` grew to 900+ lines, making it difficult to debug, test, or modify individual components without risk of regression.
-
-**Root Cause:** All functionality — chunking, embedding, retrieval, memory, metadata tagging, re-ranking — was implemented in a single file.
-
-**Solution:** Decomposed into 8 focused modules under `dgx_rag_deploy/modules/` and `dgx_rag_deploy/automation/`, reducing `rag_service.py` to a thin FastAPI orchestration layer. Each module is independently testable and modifiable.
-
----
-
-### Problem 4: Silent Retrieval Misses for Specific Document Lookups
-
-> **Impact:** Users asking about a specific document by name or ID received "I don't know" responses despite the document being ingested.
-
-**Root Cause:** Document identifiers (e.g., receipt numbers, contract IDs) were embedded within the chunk text but not stored as searchable metadata. Vector similarity alone failed to surface these exact-match lookups.
-
-**Solution:** Added a BM25 content-search fallback (F-5/F-7) that performs keyword matching against chunk text when vector search returns no confident results. This catches exact identifiers that embedding similarity misses.
-
----
-
-### Problem 5: Repository Bloat from Test Artifacts
-
-> **Impact:** The repository contained ~13,000 lines of test output files and binary artifacts, slowing clones and polluting the history.
-
-**Root Cause:** Early development committed test output files (OCR results, stress test PDFs) directly to the repository.
-
-**Solution:** Deleted the `Test_Ouputs/` directory (25 files, 12,931 lines) and updated `.gitignore` to prevent future test artifact commits.
-
----
-
-## Overall Change Statistics
-
-| Metric | Value |
-|--------|-------|
-| **Total Commits** | 15 |
-| **Lines Added** | ~4,570 |
-| **Lines Removed** | ~13,002 (mostly test cleanup) |
-| **Net New Code** | ~3,600 lines of production code |
-| **New Files Created** | 16 (modules, automation, deployment scripts, docs) |
-| **Files Deleted** | 25 (test artifacts) |
-| **Development Days** | 8 active days across 15 calendar days |
+### Deleted (25 files)
+- Entire `Test_Outputs/` directory — stale test artifacts
 
 ---
 
 ## Current System Status
 
-| Component | Status | Details |
-|-----------|--------|---------|
-| Qdrant Vector DB | ✅ Running | Docker container, port 6333 |
-| Qwen3-Embedding-8B | ✅ Running | llama.cpp server, port 8002 |
-| Qwen3.6-35B-A3B Chat | ✅ Running | llama.cpp server, port 8003, Flash Attention enabled |
-| RAG FastAPI Service | ✅ Running | Port 8081, API v3.0.0 |
-| Streamlit UI | ✅ Running | Interactive chat + ingestion dashboard |
-| Reranker (Qwen3-VL-8B) | ⏳ Optional | Available via dedicated server on port 8004 |
+| Component | Status | Port |
+|-----------|--------|------|
+| Qdrant Vector DB | ✅ Running | :6333 |
+| Embedding Model (Qwen3-Embedding-8B) | ✅ Running | :8002 |
+| Chat LLM (Qwen3.6-35B-A3B) | ✅ Running | :8003 |
+| Reranker (Qwen3-VL-Reranker-8B) | ⚙️ Optional | :8004 |
+| FastAPI RAG Service | ✅ Running | :8081 |
+| Watch Daemon | ⚙️ Optional | N/A |
+| Streamlit UI | ✅ Running | :8501 |
+
+**Architecture:** DGX Spark → GPU-accelerated inference via llama-server (Flash Attention enabled)
 
 ---
 
 ## Next Steps
 
-1. **Full Collection Re-Ingestion** — Re-ingest all documents with the new structural chunking and auto-tagging pipeline to ensure consistent metadata across the corpus
-2. **Reranker Deployment** — Deploy the Qwen3-VL-Reranker-8B model as a dedicated server for improved retrieval precision
-3. **Watch Daemon Activation** — Enable the filesystem watch daemon for hands-free auto-ingestion of new documents
-4. **Production Hardening** — Add rate limiting, persistent API key storage, and health monitoring dashboards
+1. **Full collection re-ingestion** — Required to apply new chunking strategy to existing documents.
+2. **Production monitoring** — Add logging/metrics for retrieval quality (hit rate, latency percentiles).
+3. **Reranker evaluation** — Benchmark re-ranking precision gains vs. latency cost on production queries.
+4. **Watch daemon deployment** — Enable for hands-free document ingestion from shared inbox directory.

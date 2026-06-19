@@ -1,7 +1,7 @@
 """
 Batch Ingest — CLI Tool for Bulk Document Ingestion
 ====================================================
-Ingests all markdown/text/DOCX/CSV files from a folder into a collection.
+Ingests supported document files from a folder into a collection.
 
 Usage:
     python batch_ingest.py ./documents my_collection
@@ -31,7 +31,12 @@ log = logging.getLogger("batch-ingest")
 RAG_API_URL = os.getenv("RAG_API_URL", "http://127.0.0.1:8081")
 API_KEY = os.getenv("WATCH_API_KEY", os.getenv("API_KEYS", "test_key_0000").split(":")[0])
 
-SUPPORTED = {".md", ".txt", ".csv", ".docx"}
+SUPPORTED = {
+    ".md", ".txt", ".csv",
+    ".docx", ".doc", ".dotx", ".odt", ".rtf",
+    ".xls", ".xlsx", ".xlsm", ".xlsb", ".xlt",
+    ".ppt", ".pptx",
+}
 
 
 def _headers():
@@ -49,7 +54,7 @@ def ingest_file(filepath: Path, collection: str, autotag: bool = False) -> dict:
             "markdown_content": content,
             "collection": collection,
         }
-    elif ext in {".txt", ".csv", ".docx"}:
+    elif ext in SUPPORTED:
         raw = filepath.read_bytes()
         payload = {
             "filename": filepath.name,
@@ -59,7 +64,7 @@ def ingest_file(filepath: Path, collection: str, autotag: bool = False) -> dict:
     else:
         return {"status": "skipped", "file": filepath.name, "reason": "unsupported format"}
 
-    # Optional: auto-tag first
+    # Optional: auto-tag first when content is already local markdown.
     if autotag and ext == ".md":
         try:
             tag_resp = requests.post(
@@ -89,6 +94,8 @@ def ingest_file(filepath: Path, collection: str, autotag: bool = False) -> dict:
 
 
 def main():
+    global RAG_API_URL
+
     parser = argparse.ArgumentParser(description="Batch ingest documents into RAG pipeline")
     parser.add_argument("folder", help="Folder containing documents to ingest")
     parser.add_argument("collection", help="Target Qdrant collection name")
@@ -96,7 +103,6 @@ def main():
     parser.add_argument("--api-url", default=RAG_API_URL, help="RAG API URL")
     args = parser.parse_args()
 
-    global RAG_API_URL
     RAG_API_URL = args.api_url
 
     folder = Path(args.folder).resolve()

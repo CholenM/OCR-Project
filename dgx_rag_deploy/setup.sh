@@ -8,7 +8,8 @@
 #   1. Symlinks llama-server from ~/ocr-pipeline/llama.cpp/
 #   2. Downloads embedding + chat models
 #   3. Starts Qdrant Docker container
-#   4. Creates Python venv & installs dependencies
+#   4. Checks LibreOffice headless conversion support
+#   5. Creates Python venv & installs dependencies
 #
 # Usage: sudo ./setup.sh
 # ===========================================================================
@@ -125,7 +126,21 @@ else
 fi
 
 # -------------------------------------------------------
-# 4. Python virtual environment
+# 4. LibreOffice document conversion
+# -------------------------------------------------------
+info "Checking LibreOffice headless converter..."
+if command -v soffice >/dev/null 2>&1 || command -v libreoffice >/dev/null 2>&1; then
+    ok "LibreOffice found."
+else
+    warn "LibreOffice not found. Installing libreoffice..."
+    apt-get update -qq
+    apt-get install -y -qq libreoffice >/dev/null 2>&1 || \
+        fail "LibreOffice install failed. Install it manually or set LIBREOFFICE_BIN in .env."
+    ok "LibreOffice installed."
+fi
+
+# -------------------------------------------------------
+# 5. Python virtual environment
 # -------------------------------------------------------
 info "Setting up Python environment..."
 if [ ! -d "$SCRIPT_DIR/.venv" ]; then
