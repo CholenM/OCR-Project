@@ -552,9 +552,9 @@ def render_chat():
 
 def render_ocr_dashboard():
     st.title("OCR Dashboard")
-    has_results = bool(st.session_state.ocr_results)
+    has_results = bool(st.session_state.ocr_results or st.session_state.raw_documents)
 
-    st.subheader(f"Step 1: Upload & Process {'complete' if has_results else ''}")
+    st.subheader(f"Step 1: Upload & Prepare {'complete' if has_results else ''}")
     if not has_results:
         uploaded_files = st.file_uploader(
             "Upload Documents",
@@ -658,7 +658,7 @@ def render_ocr_dashboard():
                 mime="application/zip",
                 use_container_width=True,
             )
-        if col_clr.button("Start new OCR", use_container_width=True):
+        if col_clr.button("Start new upload", use_container_width=True):
             st.session_state.ocr_results = {}
             st.session_state.raw_documents = {}
             st.session_state.ocr_metadata = {}
@@ -738,21 +738,25 @@ def render_ocr_dashboard():
                         }
                         if fname in st.session_state.ocr_results:
                             payload["markdown_content"] = st.session_state.ocr_results[fname]
+                            timeout = 120
                         else:
                             payload["raw_content_b64"] = st.session_state.raw_documents[fname]["raw_content_b64"]
+                            timeout = 300
                         st.write(f"[{i + 1}/{len(rnames)}] `{fname}`")
                         try:
-                            r = requests.post(f"{st.session_state.rag_url}/v1/ingest", headers=_headers(), json=payload, timeout=120)
+                            r = requests.post(f"{st.session_state.rag_url}/v1/ingest", headers=_headers(), json=payload, timeout=timeout)
                             if r.status_code == 200:
                                 total_chunks += r.json()["chunks"]
                             else:
-                                errors.append(fname)
-                        except Exception:
-                            errors.append(fname)
+                                errors.append(f"{fname}: HTTP {r.status_code} {r.text[:500]}")
+                        except Exception as e:
+                            errors.append(f"{fname}: {e}")
                     elapsed = time.time() - t0
                     sb.update(label=f"Ingested {total_chunks} chunks in {elapsed:.1f}s", state="complete")
                 if errors:
-                    st.error(f"Failed: {', '.join(errors)}")
+                    st.error("Some files failed to ingest.")
+                    for err in errors:
+                        st.code(err, language="text")
                 else:
                     st.success(f"Ingested {total_chunks} chunks from {len(rnames)} file(s).")
                 refresh_sessions()
