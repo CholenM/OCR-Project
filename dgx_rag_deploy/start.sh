@@ -1,12 +1,13 @@
 #!/bin/bash
 # ===========================================================================
-# RAG Pipeline — Launch Script (DGX Spark)
+# RAG Pipeline v3 — Launch Script (DGX Spark)
 # ===========================================================================
-# Starts RAG services only (no OCR — that's in ~/ocr-pipeline/):
+# Starts RAG services:
 #   1. Qdrant Docker container
 #   2. llama-server (Embeddings) on :8002
 #   3. llama-server (Chat LLM) on :8003
 #   4. FastAPI RAG service on :8081
+#   5. Watch daemon (optional, if WATCH_ENABLED=true)
 #
 # Usage: ./start.sh
 # ===========================================================================
@@ -47,7 +48,16 @@ CHAT_API_KEY="${CHAT_API_KEY:-sk-chat-layer3}"
 GPU_LAYERS="${GPU_LAYERS:-99}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8081}"
+WATCH_ENABLED="${WATCH_ENABLED:-false}"
 PID_FILE="$SCRIPT_DIR/.pids"
+
+RERANKER_MODEL_PATH="${RERANKER_MODEL_PATH:-./models/Qwen3-VL-Reranker-8B.Q8_0.gguf}"
+RERANKER_PORT="${RERANKER_PORT:-8004}"
+RERANKER_API_KEY="${RERANKER_API_KEY:-sk-rerank-layer4}"
+RERANKER_ENABLED=false
+if [ -f "$RERANKER_MODEL_PATH" ]; then
+    RERANKER_ENABLED=true
+fi
 
 # Cleanup handler
 cleanup() {
@@ -70,9 +80,19 @@ if [ ! -f "$LLAMA_SERVER_PATH" ]; then
     exit 1
 fi
 
+TOTAL_STEPS=4
+if [ "$RERANKER_ENABLED" = "true" ]; then
+    TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
+if [ "$WATCH_ENABLED" = "true" ]; then
+    TOTAL_STEPS=$((TOTAL_STEPS + 1))
+fi
+
+STEP=0
+
 echo ""
 echo "========================================================"
-echo "  RAG Pipeline — DGX Spark"
+echo "  RAG Pipeline v3 — DGX Spark"
 echo "========================================================"
 
 if command -v nvidia-smi &>/dev/null; then
@@ -97,8 +117,12 @@ wait_for_server() {
     return 1
 }
 
+# Create dirs
+mkdir -p "$SCRIPT_DIR/logs"
+
 # --- 1. Qdrant ---
-echo -e "${CYAN}[1/4]${NC} Starting Qdrant..."
+STEP=$((STEP + 1))
+echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Qdrant..."
 if docker ps --format '{{.Names}}' | grep -q '^qdrant$'; then
     echo -e "  ${GREEN}✓${NC} Qdrant already running"
 elif docker ps -a --format '{{.Names}}' | grep -q '^qdrant$'; then
@@ -110,7 +134,8 @@ else
 fi
 
 # --- 2. Embedding Model ---
-echo -e "${CYAN}[2/4]${NC} Starting Embedding model on :${EMBED_PORT}..."
+STEP=$((STEP + 1))
+echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Embedding model on :${EMBED_PORT}..."
 "$LLAMA_SERVER_PATH" \
     -m "$EMBED_MODEL_PATH" \
     --host 0.0.0.0 \
@@ -118,26 +143,54 @@ echo -e "${CYAN}[2/4]${NC} Starting Embedding model on :${EMBED_PORT}..."
     -ngl "$GPU_LAYERS" \
     --ctx-size "$EMBED_CTX_SIZE" \
     --embeddings \
+    -b 2048 \
+    --threads 10 \
     --api-key "$EMBED_API_KEY" \
-    > /dev/null 2>&1 &
+    > "$SCRIPT_DIR/logs/embed.log" 2>&1 &
 echo $! >> "$PID_FILE"
 wait_for_server "Embeddings" "$EMBED_PORT" 120
 
 # --- 3. Chat LLM ---
-echo -e "${CYAN}[3/4]${NC} Starting Chat LLM on :${CHAT_PORT}..."
+STEP=$((STEP + 1))
+echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Chat LLM on :${CHAT_PORT}..."
 "$LLAMA_SERVER_PATH" \
     -m "$CHAT_MODEL_PATH" \
     --host 0.0.0.0 \
     --port "$CHAT_PORT" \
     -ngl "$GPU_LAYERS" \
     --ctx-size "$CHAT_CTX_SIZE" \
+    --flash-attn on \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
+    -b 2048 \
+    --threads 10 \
     --api-key "$CHAT_API_KEY" \
-    > /dev/null 2>&1 &
+    > "$SCRIPT_DIR/logs/chat.log" 2>&1 &
 echo $! >> "$PID_FILE"
 wait_for_server "Chat LLM" "$CHAT_PORT" 180
 
-# --- 4. FastAPI ---
-echo -e "${CYAN}[4/4]${NC} Starting RAG service on :${API_PORT}..."
+# --- 4. Reranker (Optional — only if model exists) ---
+if [ "$RERANKER_ENABLED" = "true" ]; then
+    STEP=$((STEP + 1))
+    echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Reranker on :${RERANKER_PORT}..."
+    "$LLAMA_SERVER_PATH" \
+        -m "$RERANKER_MODEL_PATH" \
+        --host 0.0.0.0 \
+        --port "$RERANKER_PORT" \
+        -ngl "$GPU_LAYERS" \
+        --ctx-size 8192 \
+        --reranking \
+        --threads 10 \
+        --api-key "$RERANKER_API_KEY" \
+        > "$SCRIPT_DIR/logs/reranker.log" 2>&1 &
+    echo $! >> "$PID_FILE"
+    wait_for_server "Reranker" "$RERANKER_PORT" 120
+    export RERANKER_URL="http://127.0.0.1:${RERANKER_PORT}/v1/rerank"
+fi
+
+# --- 5. FastAPI ---
+STEP=$((STEP + 1))
+echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting RAG service v4 on :${API_PORT}..."
 
 export EMBED_MODEL_URL="http://127.0.0.1:${EMBED_PORT}/v1/embeddings"
 export CHAT_MODEL_URL="http://127.0.0.1:${CHAT_PORT}/v1/chat/completions"
@@ -146,9 +199,19 @@ uvicorn rag_service:app --host "$API_HOST" --port "$API_PORT" --log-level info &
 echo $! >> "$PID_FILE"
 sleep 2
 
+# --- N. Watch Daemon (Optional) ---
+if [ "$WATCH_ENABLED" = "true" ]; then
+    STEP=$((STEP + 1))
+    echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Watch daemon..."
+    mkdir -p "${WATCH_DIR:-./inbox}" "${PROCESSED_DIR:-./processed}"
+    python automation/watch_daemon.py > "$SCRIPT_DIR/logs/watch.log" 2>&1 &
+    echo $! >> "$PID_FILE"
+    echo -e "  ${GREEN}✓${NC} Watch daemon started (dir: ${WATCH_DIR:-./inbox})"
+fi
+
 echo ""
 echo "========================================================"
-echo -e "  ${GREEN}RAG Pipeline is LIVE${NC}"
+echo -e "  ${GREEN}RAG Pipeline v4 is LIVE${NC}"
 echo ""
 echo "  RAG API:     http://${API_HOST}:${API_PORT}"
 echo "  Swagger:     http://${API_HOST}:${API_PORT}/docs"
@@ -156,10 +219,22 @@ echo "  Health:      http://${API_HOST}:${API_PORT}/healthz"
 echo ""
 echo "  Embed Model: :${EMBED_PORT} (Qwen3-Embedding-8B)"
 echo "  Chat Model:  :${CHAT_PORT} (Qwen3.6-35B-A3B)"
+if [ "$RERANKER_ENABLED" = "true" ]; then
+echo "  Reranker:    :${RERANKER_PORT} (Qwen3-VL-Reranker-8B)"
+else
+echo "  Reranker:    DISABLED (model not found)"
+fi
 echo "  Qdrant:      :6333"
 echo ""
 echo "  OCR Pipeline: separate (~/ocr-pipeline/)"
+if [ "$WATCH_ENABLED" = "true" ]; then
+echo "  Watch Daemon: ACTIVE (${WATCH_DIR:-./inbox} → ${PROCESSED_DIR:-./processed})"
+else
+echo "  Watch Daemon: DISABLED (set WATCH_ENABLED=true in .env)"
+fi
 echo ""
+echo "  Features: streaming, caching, HyDE, metadata-boosted BM25"
+echo "  Defaults: rerank=OFF, agentic=OFF (fast mode)"
 echo "  Press Ctrl+C to stop."
 echo "========================================================"
 
