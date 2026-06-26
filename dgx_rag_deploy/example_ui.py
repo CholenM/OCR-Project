@@ -15,10 +15,13 @@ import pandas as pd
 import requests
 import streamlit as st
 
+from modules.ui_helpers import decode_text_upload, is_text_direct_upload, unique_upload_names
+
 DEFAULT_OCR_URL = os.getenv("OCR_API_URL", "http://192.168.50.153:8080")
 DEFAULT_RAG_URL = os.getenv("RAG_API_URL", "http://192.168.50.153:8081")
 QDRANT_DASHBOARD = os.getenv("QDRANT_DASHBOARD", "http://192.168.50.153:6333/dashboard")
 BATCH_SIZE = 3
+AUTOTAG_UI_CONCURRENCY = 2
 OCR_JOB_POLL_SECONDS = float(os.getenv("OCR_STATUS_POLL_SECONDS", "2"))
 DOC_TYPES = ["invoice", "contract", "report", "letter", "memo", "receipt", "policy", "form", "certificate", "other"]
 OCR_UPLOAD_TYPES = ["pdf", "jpg", "jpeg", "png"]
@@ -114,9 +117,10 @@ def _default_metadata():
     return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
 
 
-def _report_row(filename: str) -> dict:
-    return st.session_state.processing_report.setdefault(filename, {
+def _report_row(filename: str, source_filename: str = None) -> dict:
+    row = st.session_state.processing_report.setdefault(filename, {
         "filename": filename,
+        "source_filename": source_filename or filename,
         "pages": 0,
         "ocr_elapsed_seconds": 0.0,
         "ocr_input_tokens": 0,
@@ -137,6 +141,9 @@ def _report_row(filename: str) -> dict:
         "ingest_elapsed_seconds": 0.0,
         "total_elapsed_seconds": 0.0,
     })
+    if source_filename:
+        row["source_filename"] = source_filename
+    return row
 
 
 def _recompute_total_elapsed(row: dict):
@@ -149,7 +156,7 @@ def _recompute_total_elapsed(row: dict):
 
 
 def _record_ocr_report(filename: str, job: dict):
-    row = _report_row(filename)
+    row = _report_row(filename, job.get("source_filename"))
     pages = int(job.get("pages_total") or job.get("pages_completed") or 0)
     input_tokens = int(job.get("input_tokens", 0))
     output_tokens = int(job.get("output_tokens", 0))
@@ -412,14 +419,21 @@ def _finalize_ocr_jobs():
     st.session_state.uploader_key += 1
 
 
-def _autotag_batch(documents, endpoint, headers):
+def _autotag_one(filename: str, markdown_content: str, endpoint: str, headers: dict):
     try:
-        r = requests.post(endpoint, headers=headers, json={"documents": documents, "concurrency": 2}, timeout=300)
+        r = requests.post(
+            endpoint,
+            headers=headers,
+            json={"filename": filename, "markdown_content": markdown_content},
+            timeout=300,
+        )
         if r.status_code == 200:
-            return r.json()
-        return {"status": "error", "error": f"HTTP {r.status_code}: {r.text[:500]}"}
+            data = r.json()
+            data["filename"] = filename
+            return data
+        return {"status": "error", "filename": filename, "error": f"HTTP {r.status_code}: {r.text[:500]}"}
     except Exception as e:
-        return {"status": "error", "error": str(e)}
+        return {"status": "error", "filename": filename, "error": str(e)}
 
 
 def _run_autotag_phase():
@@ -457,29 +471,38 @@ def _run_autotag_phase():
         st.session_state.autotag_status[filename] = "running"
 
     with st.status(f"Auto-tagging {len(pending)} document(s)...", expanded=True) as sb:
-        documents = [{"filename": filename, "markdown_content": st.session_state.ocr_results[filename]} for filename in pending]
-        response = _autotag_batch(documents, f"{st.session_state.rag_url}/v1/autotag/batch", _headers())
-        results = response.get("results", []) if response.get("status") == "ok" else []
-        by_name = {item.get("filename"): item for item in results}
-        for filename in pending:
-            item = by_name.get(filename)
-            if item and item.get("status") == "ok":
-                metadata = item.get("metadata") or _default_metadata()
-                telemetry = item.get("telemetry") or {}
-                error = metadata.get("_error", "")
-                st.session_state.ocr_metadata[filename] = metadata
-                st.session_state.autotag_telemetry[filename] = telemetry
-                st.session_state.autotag_errors[filename] = error
-                st.session_state.autotag_status[filename] = "failed" if error else "done"
-                _record_autotag_report(filename, telemetry, error)
-                st.write(f"`{filename}` tagged in {telemetry.get('elapsed_seconds', 0)}s")
-            else:
-                error = (item or {}).get("error") or response.get("error") or "Auto-tag failed"
-                st.session_state.ocr_metadata[filename] = _default_metadata()
-                st.session_state.autotag_errors[filename] = error
-                st.session_state.autotag_status[filename] = "failed"
-                _record_autotag_report(filename, {}, error)
-                st.write(f"`{filename}` failed: {error}")
+        progress = st.progress(done / len(files), text=f"{done} / {len(files)} documents")
+        endpoint = f"{st.session_state.rag_url}/v1/autotag"
+        headers = _headers()
+        with ThreadPoolExecutor(max_workers=AUTOTAG_UI_CONCURRENCY) as ex:
+            futs = {
+                ex.submit(_autotag_one, filename, st.session_state.ocr_results[filename], endpoint, headers): filename
+                for filename in pending
+            }
+            for fut in as_completed(futs):
+                filename = futs[fut]
+                item = fut.result()
+                if item and item.get("status") == "ok":
+                    metadata = item.get("metadata") or _default_metadata()
+                    telemetry = item.get("telemetry") or {}
+                    error = metadata.get("_error", "")
+                    st.session_state.ocr_metadata[filename] = metadata
+                    st.session_state.autotag_telemetry[filename] = telemetry
+                    st.session_state.autotag_errors[filename] = error
+                    st.session_state.autotag_status[filename] = "failed" if error else "done"
+                    _record_autotag_report(filename, telemetry, error)
+                    st.write(f"`{filename}` tagged in {telemetry.get('elapsed_seconds', 0)}s")
+                else:
+                    error = (item or {}).get("error") or "Auto-tag failed"
+                    metadata = _default_metadata()
+                    metadata["_error"] = error
+                    st.session_state.ocr_metadata[filename] = metadata
+                    st.session_state.autotag_errors[filename] = error
+                    st.session_state.autotag_status[filename] = "failed"
+                    _record_autotag_report(filename, {}, error)
+                    st.write(f"`{filename}` failed: {error}")
+                done = sum(1 for name in files if st.session_state.autotag_status.get(name) in {"done", "failed"})
+                progress.progress(done / len(files), text=f"{done} / {len(files)} documents")
         sb.update(label="Auto-tagging complete", state="complete")
 
 
@@ -604,6 +627,7 @@ def ask_streaming(prompt: str, active: str):
         "session_id": active,
         "memory_enabled": settings["memory_enabled"],
         "memory_top_k": int(settings["memory_top_k"]),
+        "auto_extract_filters": settings["auto_extract"],
         "rerank": settings["rerank"],
         "agentic": settings["agentic"],
         "hyde": settings["hyde"],
@@ -915,8 +939,10 @@ def render_ocr_dashboard():
         if uploaded_files:
             st.caption(f"{len(uploaded_files)} file(s) selected")
         ocr_uploads = [f for f in (uploaded_files or []) if not _is_direct_upload(f.name)]
-        direct_uploads = [f for f in (uploaded_files or []) if _is_direct_upload(f.name)]
-        has_pdf = any(f.type == "application/pdf" for f in ocr_uploads)
+        has_pdf = any(
+            f.type == "application/pdf" or os.path.splitext(f.name)[1].lower() == ".pdf"
+            for f in ocr_uploads
+        )
         if has_pdf:
             dpi_value = st.slider("DPI", 120, 350, 200, 10)
             mode_value = st.selectbox("Mode", ["serial", "concurrent"], index=1)
@@ -927,7 +953,6 @@ def render_ocr_dashboard():
             if not st.session_state.api_key_input or not uploaded_files:
                 st.warning("Provide API key and upload files.")
             else:
-                total = len(ocr_uploads)
                 st.session_state.ocr_results = {}
                 st.session_state.raw_documents = {}
                 st.session_state.pending_raw_documents = {}
@@ -943,49 +968,82 @@ def render_ocr_dashboard():
                 params = {"dpi": dpi_value, "mode": mode_value}
                 if mode_value == "concurrent":
                     params["max_concurrency"] = 4
-                file_data = [(f.name, f.getvalue(), f.type) for f in ocr_uploads]
+                unique_names = unique_upload_names([f.name for f in uploaded_files])
+                upload_entries = [
+                    {
+                        "name": unique_name,
+                        "source_filename": f.name,
+                        "data": f.getvalue(),
+                        "type": f.type,
+                    }
+                    for f, unique_name in zip(uploaded_files, unique_names)
+                ]
+                ocr_entries = [entry for entry in upload_entries if not _is_direct_upload(entry["name"])]
+                direct_entries = [entry for entry in upload_entries if _is_direct_upload(entry["name"])]
+                total = len(ocr_entries)
 
                 with st.status(f"Submitting {len(uploaded_files)} file(s)...", expanded=True) as sb:
                     t0 = time.time()
                     prog = st.progress(0, text=f"0 / {len(uploaded_files)}")
                     done = 0
-                    for f in direct_uploads:
-                        data = f.getvalue()
-                        st.session_state.pending_raw_documents[f.name] = {
-                            "raw_content_b64": base64.b64encode(data).decode("utf-8"),
-                            "size": len(data),
-                        }
-                        st.session_state.ocr_metadata[f.name] = _default_metadata()
-                        _report_row(f.name)
+                    for entry in direct_entries:
+                        data = entry["data"]
+                        filename = entry["name"]
+                        source_filename = entry["source_filename"]
+                        if is_text_direct_upload(filename):
+                            st.session_state.ocr_results[filename] = decode_text_upload(data)
+                            st.session_state.ocr_metadata[filename] = _default_metadata()
+                            _report_row(filename, source_filename)
+                            st.write(f"`{filename}` ready for auto-tagging")
+                        else:
+                            st.session_state.pending_raw_documents[filename] = {
+                                "raw_content_b64": base64.b64encode(data).decode("utf-8"),
+                                "size": len(data),
+                                "source_filename": source_filename,
+                            }
+                            st.session_state.ocr_metadata[filename] = _default_metadata()
+                            row = _report_row(filename, source_filename)
+                            row["status"] = "conversion_pending"
+                            st.write(f"`{filename}` ready for RAG conversion during ingestion")
                         done += 1
                         prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
-                        st.write(f"`{f.name}` ready for RAG conversion")
                     for batch_start in range(0, total, BATCH_SIZE):
-                        batch = file_data[batch_start:batch_start + BATCH_SIZE]
-                        slots = {n: st.empty() for n, _, _ in batch}
+                        batch = ocr_entries[batch_start:batch_start + BATCH_SIZE]
+                        slots = {entry["name"]: st.empty() for entry in batch}
                         for n in slots:
                             slots[n].markdown(f"`{n}` processing...")
                         with ThreadPoolExecutor(max_workers=BATCH_SIZE) as ex:
                             futs = {
-                                ex.submit(_submit_ocr_job, n, d, t, f"{st.session_state.ocr_url}/v1/ocr/jobs", _headers(), params): n
-                                for n, d, t in batch
+                                ex.submit(
+                                    _submit_ocr_job,
+                                    entry["name"],
+                                    entry["data"],
+                                    entry["type"],
+                                    f"{st.session_state.ocr_url}/v1/ocr/jobs",
+                                    _headers(),
+                                    params,
+                                ): entry
+                                for entry in batch
                             }
                             for f in as_completed(futs):
-                                nm = futs[f]
+                                entry = futs[f]
+                                nm = entry["name"]
                                 n, job, err = f.result()
                                 if err:
                                     slots[nm].markdown(f"`{n}` submission failed: {err}")
                                     st.session_state.ocr_job_failures[n] = err
                                 else:
+                                    job["source_filename"] = entry["source_filename"]
                                     slots[nm].markdown(f"`{n}` queued for OCR")
                                     st.session_state.ocr_jobs[n] = job
+                                    _report_row(n, entry["source_filename"])
                                 done += 1
                                 prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
                     sb.update(label=f"Submitted in {time.time() - t0:.1f}s", state="complete")
 
                 if st.session_state.ocr_jobs:
                     st.rerun()
-                elif st.session_state.pending_raw_documents:
+                elif st.session_state.ocr_results or st.session_state.pending_raw_documents:
                     st.session_state.raw_documents.update(st.session_state.pending_raw_documents)
                     st.session_state.pending_raw_documents = {}
                     st.session_state.ocr_step = 2
@@ -1036,12 +1094,22 @@ def render_ocr_dashboard():
             st.rerun()
 
     if has_results:
+        if st.session_state.ocr_results:
+            unfinished_autotag = [
+                filename for filename in st.session_state.ocr_results
+                if st.session_state.autotag_status.get(filename) not in {"done", "failed"}
+            ]
+            if unfinished_autotag:
+                _run_autotag_phase()
+
         st.markdown("---")
         st.subheader("Step 2: Review & Edit Metadata")
         rnames = list(st.session_state.ocr_results.keys()) + list(st.session_state.raw_documents.keys())
         edit_file = st.selectbox("Select file", rnames, key="meta_edit_file")
         meta = st.session_state.ocr_metadata.get(edit_file, {})
         key_base = f"ocr_meta_{edit_file}"
+        if edit_file in st.session_state.raw_documents:
+            st.info("This file will use default metadata until it is converted during ingestion.")
         mc1, mc2 = st.columns(2)
         with mc1:
             dt_idx = DOC_TYPES.index(meta.get("doc_type", "other")) if meta.get("doc_type", "other") in DOC_TYPES else 9
@@ -1082,7 +1150,7 @@ def render_ocr_dashboard():
             else:
                 raw_meta = st.session_state.raw_documents.get(pf, {})
                 l.text_area("raw", value=f"{pf}\n{raw_meta.get('size', 0)} bytes\nConverted during RAG ingestion.", height=300, label_visibility="collapsed")
-                r_.info("This file will be converted to Markdown by the RAG API during ingestion.")
+                r_.info("This file will be converted to Markdown by the RAG API during ingestion. Metadata stays editable, but auto-tagging waits for a text/Markdown copy.")
 
         st.markdown("---")
         st.subheader("Step 3: Ingest to Session")
@@ -1313,7 +1381,7 @@ def render_advanced_settings():
     with cols[1]:
         st.checkbox("Agentic RAG", key="draft_agentic", help="Decomposes complex queries into sub-queries.")
     with cols[2]:
-        st.checkbox("Auto Filters", key="draft_auto_extract", help="LLM extracts metadata filters from query in non-streaming mode.")
+        st.checkbox("Auto Filters", key="draft_auto_extract", help="LLM extracts metadata filters from the query.")
     with cols[3]:
         st.checkbox("HyDE", key="draft_hyde", help="Generates a hypothetical answer for better embeddings.")
     with cols[4]:

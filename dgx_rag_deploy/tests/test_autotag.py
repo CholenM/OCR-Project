@@ -7,9 +7,11 @@ from unittest.mock import patch
 # The local lightweight test environment does not install every optional RAG
 # dependency. Production imports the real mmh3 package from requirements.txt.
 sys.modules.setdefault("mmh3", types.SimpleNamespace(hash=lambda value, signed=False: hash(value)))
+sys.modules.setdefault("dotenv", types.SimpleNamespace(load_dotenv=lambda *args, **kwargs: None))
 
 import rag_service
 from modules import metadata
+from modules import ui_helpers
 
 
 class MetadataAutotagTests(unittest.TestCase):
@@ -90,6 +92,32 @@ class MetadataAutotagTests(unittest.TestCase):
         self.assertEqual(len(prompt_lengths), 2)
         self.assertLess(prompt_lengths[1], prompt_lengths[0])
 
+    def test_clean_json_response_handles_fences_and_prose(self):
+        fenced = metadata._clean_json_response('```json\n{"doc_type": "memo"}\n```')
+        prose = metadata._clean_json_response('Here is the JSON:\n{"doc_type": "report"}\nDone.')
+
+        self.assertEqual(fenced, '{"doc_type": "memo"}')
+        self.assertEqual(prose, '{"doc_type": "report"}')
+
+    def test_clean_json_response_reports_empty_or_malformed_output(self):
+        with self.assertRaisesRegex(ValueError, "empty response"):
+            metadata._clean_json_response("")
+        with self.assertRaisesRegex(ValueError, "Raw response: no json here"):
+            metadata._clean_json_response("no json here")
+
+    def test_autotag_malformed_output_returns_default_metadata_with_error(self):
+        with patch.object(metadata, "_chat_completion", return_value="not json"):
+            result = metadata.autotag_document(
+                "Document body",
+                "http://autotag.local/v1/chat/completions",
+                "AutotagModel",
+                "secret",
+            )
+
+        self.assertEqual(result["doc_type"], "other")
+        self.assertIn("_error", result)
+        self.assertIn("Raw response", result["_error"])
+
 
 class RagServiceAutotagTests(unittest.TestCase):
     def setUp(self):
@@ -164,6 +192,57 @@ class RagServiceAutotagTests(unittest.TestCase):
         self.assertEqual([item["status"] for item in result["results"]], ["ok", "error", "ok"])
         self.assertEqual(result["results"][0]["metadata"]["tags"], ["a.md"])
         self.assertEqual(result["results"][1]["error"], "No markdown_content provided")
+
+
+class RagServiceCacheAndStreamingTests(unittest.TestCase):
+    def test_cache_key_includes_filters_and_retrieval_settings(self):
+        base = rag_service._cache_key("query", "collection", 10, {"doc_type": "invoice"}, False, False, False, "sys")
+
+        self.assertNotEqual(base, rag_service._cache_key("query", "collection", 10, {"doc_type": "contract"}, False, False, False, "sys"))
+        self.assertNotEqual(base, rag_service._cache_key("query", "collection", 10, {"doc_type": "invoice"}, True, False, False, "sys"))
+        self.assertNotEqual(base, rag_service._cache_key("query", "collection", 10, {"doc_type": "invoice"}, False, True, False, "sys"))
+        self.assertNotEqual(base, rag_service._cache_key("query", "collection", 10, {"doc_type": "invoice"}, False, False, True, "sys"))
+        self.assertNotEqual(base, rag_service._cache_key("query", "collection", 10, {"doc_type": "invoice"}, False, False, False, "other"))
+
+    def test_streaming_chat_honors_auto_extract_filters(self):
+        captured = {}
+
+        def fake_retrieve(query, client, collection, embed_url, embed_model, embed_key, top_k, filters):
+            captured["filters"] = filters
+            return [0.1, 0.2], []
+
+        async def run_stream():
+            with (
+                patch.object(rag_service, "_qclient", return_value=object()),
+                patch.object(rag_service, "extract_filters_from_query", return_value={"doc_type": "invoice"}),
+                patch.object(rag_service, "retrieve", side_effect=fake_retrieve),
+            ):
+                response = await rag_service.chat_stream(
+                    api_key="test_key_0000",
+                    query="find invoices",
+                    collection="docs",
+                    auto_extract_filters=True,
+                    memory_enabled=False,
+                )
+                async for _ in response.body_iterator:
+                    pass
+
+        asyncio.run(run_stream())
+
+        self.assertEqual(captured["filters"], {"doc_type": "invoice"})
+
+
+class UiHelperTests(unittest.TestCase):
+    def test_unique_upload_names_dedupes_case_insensitively(self):
+        names = ui_helpers.unique_upload_names(["scan.pdf", "SCAN.pdf", "scan.pdf", "notes.txt"])
+
+        self.assertEqual(names, ["scan.pdf", "SCAN (2).pdf", "scan (3).pdf", "notes.txt"])
+
+    def test_text_direct_upload_detection_and_decoding(self):
+        self.assertTrue(ui_helpers.is_text_direct_upload("contract.md"))
+        self.assertTrue(ui_helpers.is_text_direct_upload("data.CSV"))
+        self.assertFalse(ui_helpers.is_text_direct_upload("slides.pptx"))
+        self.assertEqual(ui_helpers.decode_text_upload("hello".encode("utf-8")), "hello")
 
 
 if __name__ == "__main__":

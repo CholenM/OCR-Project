@@ -72,11 +72,30 @@ def _chat_completion(
 
 
 def _clean_json_response(raw: str) -> str:
-    """Strip markdown code fences from LLM JSON responses."""
-    cleaned = raw.strip()
-    if cleaned.startswith("```"):
-        cleaned = cleaned.split("\n", 1)[-1].rsplit("```", 1)[0]
-    return cleaned.strip()
+    """Return the first JSON object from a model response."""
+    if raw is None:
+        raise ValueError("LLM returned an empty response")
+    cleaned = str(raw).strip()
+    if not cleaned:
+        raise ValueError("LLM returned an empty response")
+
+    fence = re.search(r"```(?:json)?\s*(.*?)```", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if fence:
+        cleaned = fence.group(1).strip()
+
+    decoder = json.JSONDecoder()
+    for idx, char in enumerate(cleaned):
+        if char != "{":
+            continue
+        try:
+            parsed, end = decoder.raw_decode(cleaned[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return cleaned[idx:idx + end].strip()
+
+    excerpt = re.sub(r"\s+", " ", cleaned)[:200]
+    raise ValueError(f"LLM did not return a JSON object. Raw response: {excerpt}")
 
 
 def build_autotag_snippet(markdown_text: str, max_chars: int = 3000) -> str:

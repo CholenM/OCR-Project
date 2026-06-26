@@ -225,9 +225,29 @@ def _chat(messages, temperature=0.7):
     return r.json()["choices"][0]["message"]["content"]
 
 
-def _cache_key(query: str, collection: str, top_k: int) -> str:
+def _cache_key(
+    query: str,
+    collection: str,
+    top_k: int,
+    filters: dict = None,
+    rerank: bool = False,
+    agentic: bool = False,
+    hyde: bool = False,
+    system_prompt: str = None,
+) -> str:
     """Generate deterministic cache key."""
-    return hashlib.sha256(f"{query}|{collection}|{top_k}".encode()).hexdigest()[:16]
+    material = {
+        "query": query,
+        "collection": collection,
+        "top_k": top_k,
+        "filters": filters or {},
+        "rerank": bool(rerank),
+        "agentic": bool(agentic),
+        "hyde": bool(hyde),
+        "system_prompt": system_prompt or "",
+    }
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:16]
 
 
 def _cache_get(key: str) -> Optional[dict]:
@@ -701,7 +721,7 @@ async def ingest_document(
         import base64
         try:
             raw_bytes = base64.b64decode(raw_content_b64)
-            conversion = convert_to_markdown(filename, raw_bytes)
+            conversion = await asyncio.to_thread(convert_to_markdown, filename, raw_bytes)
             markdown_content = conversion.markdown
         except ConversionError as e:
             raise HTTPException(status_code=e.status_code, detail={"error": str(e), "warnings": e.warnings})
@@ -712,7 +732,7 @@ async def ingest_document(
         raise HTTPException(status_code=400, detail="No content provided (markdown_content or raw_content_b64 required)")
 
     try:
-        result = _do_ingest(filename, markdown_content, collection, chunk_size, metadata, api_key)
+        result = await asyncio.to_thread(_do_ingest, filename, markdown_content, collection, chunk_size, metadata, api_key)
         return _attach_conversion_telemetry(result, conversion)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Ingestion failed: {str(e)}")
@@ -785,15 +805,6 @@ async def chat_with_documents(
     memory_top_k = memory_top_k or MEMORY_TOP_K
     use_memory = bool(session_id) and memory_enabled and MEMORY_ENABLED
 
-    # Check cache (only for stateless queries without session)
-    # F-8: Skip cache for broad queries — prevents stale results during active ingestion
-    cache_k = None
-    if not session_id and not _is_broad_query(query):
-        cache_k = _cache_key(query, collection, top_k)
-        cached = _cache_get(cache_k)
-        if cached:
-            return cached
-
     try:
         t0 = time.time()
         client = _qclient()
@@ -807,6 +818,15 @@ async def chat_with_documents(
                     log.info(f"Auto-extracted filters: {active_filters}")
             except Exception:
                 pass
+
+        # Check cache after filters/settings are resolved.
+        # Skip sessions and broad queries to avoid stale answers during active ingestion.
+        cache_k = None
+        if not session_id and not _is_broad_query(query):
+            cache_k = _cache_key(query, collection, top_k, active_filters, rerank, agentic, hyde, system_prompt)
+            cached = _cache_get(cache_k)
+            if cached:
+                return cached
 
         # --- HyDE query expansion (OFF by default) ---
         search_query = _hyde_expand(query) if hyde else query
@@ -900,6 +920,7 @@ async def chat_stream(
     memory_enabled: bool = Body(True, embed=True),
     memory_top_k: int = Body(None, embed=True),
     filters: dict = Body(None, embed=True),
+    auto_extract_filters: bool = Body(False, embed=True),
     rerank: bool = Body(False, embed=True),
     agentic: bool = Body(False, embed=True),
     hyde: bool = Body(False, embed=True),
@@ -915,6 +936,15 @@ async def chat_stream(
             t0 = time.time()
             client = _qclient()
 
+            active_filters = filters or {}
+            if auto_extract_filters and not filters:
+                try:
+                    active_filters = extract_filters_from_query(query, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY)
+                    if active_filters:
+                        log.info(f"Auto-extracted filters: {active_filters}")
+                except Exception:
+                    pass
+
             # Retrieve
             search_query = _hyde_expand(query) if hyde else query
             if agentic:
@@ -922,13 +952,13 @@ async def chat_stream(
                     search_query, client, collection,
                     EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
                     CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY,
-                    top_k, filters or {},
+                    top_k, active_filters,
                 )
             else:
                 query_vector, sources = retrieve(
                     search_query, client, collection,
                     EMBED_MODEL_URL, EMBED_MODEL_NAME, EMBED_API_KEY,
-                    top_k, filters or {},
+                    top_k, active_filters,
                 )
 
             if rerank and sources:
