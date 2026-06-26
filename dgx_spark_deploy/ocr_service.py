@@ -22,7 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Header, Query
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, status, Header, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 import fitz  # PyMuPDF
@@ -40,11 +40,16 @@ API_PORT = int(os.getenv("API_PORT", "8080"))
 API_HOST = os.getenv("API_HOST", "0.0.0.0")
 MAX_PAGE_CONCURRENCY = int(os.getenv("MAX_CONCURRENCY", "4"))
 OCR_JOB_DIR = Path(os.getenv("OCR_JOB_DIR", "./ocr_jobs"))
-OCR_JOB_CONCURRENCY = int(os.getenv("OCR_JOB_CONCURRENCY", "1"))
+OCR_JOB_CONCURRENCY = max(1, min(int(os.getenv("OCR_JOB_CONCURRENCY", "3")), 3))
+OCR_RECOVER_JOBS_ON_STARTUP = os.getenv("OCR_RECOVER_JOBS_ON_STARTUP", "true").lower() == "true"
 OCR_JOB_RETENTION_HOURS = int(os.getenv("OCR_JOB_RETENTION_HOURS", "24"))
 
 _job_queue = asyncio.Queue()
 _job_workers = []
+
+
+class OCRJobCancelled(Exception):
+    """Raised when a queued or running OCR job is cancelled."""
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -256,6 +261,52 @@ def _job_for_api_key(job_id: str, api_key: str) -> dict:
     return job
 
 
+def _job_cancel_requested(job_id: str) -> bool:
+    try:
+        return bool(_read_job(job_id).get("cancel_requested"))
+    except FileNotFoundError:
+        return False
+
+
+def _mark_job_cancelled(job_id: str, reason: str = "Cancelled by user") -> dict:
+    job = _read_job(job_id)
+    if job.get("status") == "completed":
+        return job
+    if job.get("status") != "cancelled":
+        job.update({
+            "status": "cancelled",
+            "cancel_requested": True,
+            "cancelled_at": _now(),
+            "cancel_reason": reason,
+            "finished_at": _now(),
+            "updated_at": _now(),
+            "error": None,
+        })
+        _write_job(job_id, job)
+        logger.info(f"OCR JOB CANCELLED | id={job_id} | file={job.get('filename')} | reason={reason}")
+    return job
+
+
+def _request_job_cancel(job_id: str, reason: str = "Cancelled by user") -> dict:
+    job = _read_job(job_id)
+    if job.get("status") in {"completed", "failed", "cancelled"}:
+        return job
+    job.update({
+        "cancel_requested": True,
+        "cancel_reason": reason,
+        "cancelled_at": _now(),
+        "updated_at": _now(),
+    })
+    if job.get("status") == "queued":
+        job["status"] = "cancelled"
+        job["finished_at"] = _now()
+    elif job.get("status") == "running":
+        job["status"] = "cancelling"
+    _write_job(job_id, job)
+    logger.info(f"OCR JOB CANCEL REQUESTED | id={job_id} | file={job.get('filename')} | status={job.get('status')}")
+    return job
+
+
 def _cleanup_expired_jobs():
     OCR_JOB_DIR.mkdir(parents=True, exist_ok=True)
     expiry = time.time() - (OCR_JOB_RETENTION_HOURS * 3600)
@@ -294,7 +345,16 @@ def _record_usage(api_key: str, filename: str, pages: int, input_tokens: int, ou
     return total_tokens, tokens_per_sec, session_cost
 
 
-async def _process_ocr_bytes(file_bytes: bytes, filename: str, content_type: str, dpi: int, mode: str, max_concurrency: int, progress_callback=None) -> dict:
+async def _process_ocr_bytes(
+    file_bytes: bytes,
+    filename: str,
+    content_type: str,
+    dpi: int,
+    mode: str,
+    max_concurrency: int,
+    progress_callback=None,
+    cancel_check=None,
+) -> dict:
     """Extract OCR text with bounded page batches and optional progress reporting."""
     mode = mode.lower().strip()
     if mode not in {"serial", "concurrent"}:
@@ -309,6 +369,10 @@ async def _process_ocr_bytes(file_bytes: bytes, filename: str, content_type: str
     async def report(total: int, completed: int):
         if progress_callback:
             await progress_callback(total, completed, input_tokens, output_tokens, page_failures)
+
+    def check_cancelled():
+        if cancel_check and cancel_check():
+            raise OCRJobCancelled("OCR job cancelled by user")
 
     async def process_page(index: int, payload: str):
         try:
@@ -331,6 +395,7 @@ async def _process_ocr_bytes(file_bytes: bytes, filename: str, content_type: str
         batch_size = 1 if mode == "serial" else effective_concurrency
         try:
             for batch_start in range(0, total_pages, batch_size):
+                check_cancelled()
                 batch = []
                 for index in range(batch_start, min(batch_start + batch_size, total_pages)):
                     pix = doc[index].get_pixmap(dpi=dpi)
@@ -349,6 +414,7 @@ async def _process_ocr_bytes(file_bytes: bytes, filename: str, content_type: str
                         page_text[index] = text
                         logger.info(f"OCR page complete: {filename} | page {index + 1}/{total_pages}")
                     await report(total_pages, completed)
+                check_cancelled()
         finally:
             doc.close()
         if not page_text:
@@ -367,12 +433,14 @@ async def _process_ocr_bytes(file_bytes: bytes, filename: str, content_type: str
 
     if content_type in {"image/jpeg", "image/jpg", "image/png"}:
         mime_type = content_type or "image/png"
+        check_cancelled()
         try:
             text, input_tokens, output_tokens = await asyncio.to_thread(
                 query_model_ocr, base64.b64encode(file_bytes).decode("utf-8"), mime_type
             )
         except Exception as exc:
             raise RuntimeError(f"OCR failed for image: {exc}") from exc
+        check_cancelled()
         if not text or not text.strip():
             raise RuntimeError("Model returned an empty OCR response")
         await report(1, 1)
@@ -444,6 +512,9 @@ def _normalize_markdown_tables(markdown_text: str) -> str:
 # ---------------------------------------------------------------------------
 async def _run_ocr_job(job_id: str):
     job = _read_job(job_id)
+    if job.get("cancel_requested") or job.get("status") == "cancelled":
+        _mark_job_cancelled(job_id, job.get("cancel_reason") or "Cancelled before start")
+        return
     job.update({"status": "running", "started_at": _now(), "error": None})
     _write_job(job_id, job)
     logger.info(f"OCR JOB START | id={job_id} | file={job['filename']}")
@@ -453,7 +524,7 @@ async def _run_ocr_job(job_id: str):
         current = _read_job(job_id)
         current.update(
             {
-                "status": "running",
+                "status": "cancelling" if current.get("cancel_requested") else "running",
                 "pages_total": total,
                 "pages_completed": completed,
                 "input_tokens": input_tokens,
@@ -476,7 +547,10 @@ async def _run_ocr_job(job_id: str):
             job["mode"],
             int(job["max_concurrency"]),
             progress,
+            lambda: _job_cancel_requested(job_id),
         )
+        if _job_cancel_requested(job_id):
+            raise OCRJobCancelled("OCR job cancelled by user")
         elapsed = round(time.time() - started, 2)
         total_tokens, tokens_per_sec, session_cost = _record_usage(
             job["api_key"], job["filename"], result["pages"], result["input_tokens"], result["output_tokens"], elapsed
@@ -506,6 +580,15 @@ async def _run_ocr_job(job_id: str):
             f"OCR JOB COMPLETE | id={job_id} | file={job['filename']} | pages={result['pages']} | "
             f"tokens={total_tokens} | elapsed={elapsed}s | page_failures={len(result['page_failures'])}"
         )
+    except OCRJobCancelled as exc:
+        elapsed = round(time.time() - started, 2)
+        job = _mark_job_cancelled(job_id, str(exc))
+        job.update({
+            "elapsed_seconds": elapsed,
+            "updated_at": _now(),
+            "finished_at": job.get("finished_at") or _now(),
+        })
+        _write_job(job_id, job)
     except Exception as exc:
         elapsed = round(time.time() - started, 2)
         job = _read_job(job_id)
@@ -543,14 +626,20 @@ async def start_ocr_job_workers():
     for metadata_path in OCR_JOB_DIR.glob("*/job.json"):
         try:
             job = json.loads(metadata_path.read_text(encoding="utf-8"))
-            if job.get("status") in {"queued", "running"} and Path(job.get("source_path", "")).exists():
+            if job.get("status") in {"queued", "running", "cancelling"} and Path(job.get("source_path", "")).exists():
+                if job.get("cancel_requested") or not OCR_RECOVER_JOBS_ON_STARTUP:
+                    reason = job.get("cancel_reason") or "Cancelled during startup recovery"
+                    if not OCR_RECOVER_JOBS_ON_STARTUP:
+                        reason = "Cancelled because OCR_RECOVER_JOBS_ON_STARTUP=false"
+                    _mark_job_cancelled(job["job_id"], reason)
+                    continue
                 job.update({"status": "queued", "updated_at": _now(), "recovered_after_restart": True})
                 _write_job(job["job_id"], job)
                 await _job_queue.put(job["job_id"])
                 logger.info(f"OCR JOB RECOVERED | id={job['job_id']} | file={job['filename']}")
         except Exception as exc:
             logger.warning(f"OCR job recovery skipped for {metadata_path}: {exc}")
-    for worker_number in range(max(1, OCR_JOB_CONCURRENCY)):
+    for worker_number in range(OCR_JOB_CONCURRENCY):
         _job_workers.append(asyncio.create_task(_ocr_job_worker(worker_number + 1)))
 
 
@@ -647,6 +736,31 @@ async def submit_ocr_job(
 async def get_ocr_job(job_id: str, api_key: str = Depends(verify_api_key)):
     """Return status and progress for a submitted OCR job."""
     return _public_job(_job_for_api_key(job_id, api_key))
+
+
+@app.delete("/v1/ocr/jobs/{job_id}", tags=["OCR Jobs"])
+async def cancel_ocr_job(job_id: str, api_key: str = Depends(verify_api_key)):
+    """Cancel a queued or running OCR job."""
+    _job_for_api_key(job_id, api_key)
+    job = _request_job_cancel(job_id)
+    return _public_job(job)
+
+
+@app.post("/v1/ocr/jobs/cancel", tags=["OCR Jobs"])
+async def cancel_ocr_jobs(payload: dict = Body(...), api_key: str = Depends(verify_api_key)):
+    """Cancel multiple queued or running OCR jobs."""
+    job_ids = payload.get("job_ids") or []
+    if not isinstance(job_ids, list):
+        raise HTTPException(status_code=400, detail="job_ids must be a list.")
+    cancelled = []
+    errors = []
+    for job_id in job_ids:
+        try:
+            _job_for_api_key(str(job_id), api_key)
+            cancelled.append(_public_job(_request_job_cancel(str(job_id))))
+        except HTTPException as exc:
+            errors.append({"job_id": job_id, "status_code": exc.status_code, "error": exc.detail})
+    return {"status": "ok", "cancelled": cancelled, "errors": errors}
 
 
 @app.get("/v1/ocr/jobs/{job_id}/result", response_class=Response, tags=["OCR Jobs"])
@@ -746,6 +860,7 @@ if __name__ == "__main__":
     logger.info(f"Starting OCR Pipeline API on {API_HOST}:{API_PORT}")
     logger.info(f"Model server: {MODEL_URL} ({MODEL_NAME})")
     logger.info(f"Max page concurrency: {MAX_PAGE_CONCURRENCY}")
+    logger.info(f"Max document concurrency: {OCR_JOB_CONCURRENCY}")
     logger.info(f"Swagger UI: http://{API_HOST}:{API_PORT}/docs")
 
     uvicorn.run(

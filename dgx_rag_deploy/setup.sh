@@ -6,7 +6,7 @@
 # Reuses the llama.cpp binary already compiled in ~/ocr-pipeline/.
 #
 #   1. Symlinks llama-server from ~/ocr-pipeline/llama.cpp/
-#   2. Downloads embedding + chat models
+#   2. Downloads embedding + chat + autotag models
 #   3. Starts Qdrant Docker container
 #   4. Checks LibreOffice headless conversion support
 #   5. Creates Python venv & installs dependencies
@@ -105,6 +105,26 @@ else
     ok "Chat LLM downloaded."
 fi
 
+# Auto-tagging LLM
+if [ -f "$SCRIPT_DIR/models/Qwen3VL-8B-Instruct-F16.gguf" ]; then
+    ok "Auto-tagging model already present."
+else
+    info "Downloading Qwen3-VL-8B-Instruct autotag model..."
+    wget -q --show-progress -O "$SCRIPT_DIR/models/Qwen3VL-8B-Instruct-F16.gguf" \
+        "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/Qwen3VL-8B-Instruct-F16.gguf"
+    ok "Auto-tagging model downloaded."
+fi
+
+# Auto-tagging projector (downloaded for completeness; not loaded by start.sh for text-only tagging)
+if [ -f "$SCRIPT_DIR/models/mmproj-Qwen3VL-8B-Instruct-F16.gguf" ]; then
+    ok "Auto-tagging mmproj already present."
+else
+    info "Downloading Qwen3-VL-8B-Instruct autotag mmproj..."
+    wget -q --show-progress -O "$SCRIPT_DIR/models/mmproj-Qwen3VL-8B-Instruct-F16.gguf" \
+        "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/main/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+    ok "Auto-tagging mmproj downloaded."
+fi
+
 # -------------------------------------------------------
 # 3. Qdrant Docker container
 # -------------------------------------------------------
@@ -163,6 +183,28 @@ else
     ok ".env already exists."
 fi
 
+ensure_env_var() {
+    local key="$1"
+    local value="$2"
+    local old_pattern="${3:-}"
+    if ! grep -q "^${key}=" "$SCRIPT_DIR/.env"; then
+        echo "${key}=${value}" >> "$SCRIPT_DIR/.env"
+        ok "Added ${key} to .env"
+    elif [ -n "$old_pattern" ] && grep -Eq "^${key}=.*${old_pattern}" "$SCRIPT_DIR/.env"; then
+        sed -i "s|^${key}=.*|${key}=${value}|" "$SCRIPT_DIR/.env"
+        ok "Updated ${key} in .env"
+    fi
+}
+
+ensure_env_var "AUTOTAG_MODEL_PATH" '"./models/Qwen3VL-8B-Instruct-F16.gguf"' 'Qwen3\.5-4B|HauhauCS'
+ensure_env_var "AUTOTAG_MMPROJ_PATH" '"./models/mmproj-Qwen3VL-8B-Instruct-F16.gguf"' 'Qwen3\.5-4B|HauhauCS'
+ensure_env_var "AUTOTAG_PORT" '"8005"'
+ensure_env_var "AUTOTAG_CTX_SIZE" '"4096"'
+ensure_env_var "AUTOTAG_API_KEY" '"sk-autotag-layer3b"'
+ensure_env_var "AUTOTAG_MODEL_NAME" '"Qwen3VL-8B-Instruct-Autotag"' 'Qwen3\.5-4B-Autotag'
+ensure_env_var "AUTOTAG_MAX_CHARS" '"800"' '"?3000"?'
+ensure_env_var "AUTOTAG_CACHE_SIZE" '"512"'
+
 # Fix ownership
 if [ -n "$REAL_USER" ]; then
     chown -R "$REAL_USER":"$REAL_USER" "$SCRIPT_DIR/.venv" "$SCRIPT_DIR/models" 2>/dev/null || true
@@ -176,6 +218,7 @@ echo -e "  ${GREEN}RAG Pipeline setup complete!${NC}"
 echo ""
 echo "  Embedding model: $SCRIPT_DIR/models/Qwen3-Embedding-8B-Q4_K_M.gguf"
 echo "  Chat LLM:        $SCRIPT_DIR/models/Qwen3.6-35B-A3B-...-Q4_K_M.gguf"
+echo "  Auto-tag LLM:    $SCRIPT_DIR/models/Qwen3VL-8B-Instruct-F16.gguf"
 echo "  llama-server:    $LLAMA_BIN"
 echo "  Qdrant:          http://localhost:6333"
 echo ""

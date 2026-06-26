@@ -6,8 +6,9 @@
 #   1. Qdrant Docker container
 #   2. llama-server (Embeddings) on :8002
 #   3. llama-server (Chat LLM) on :8003
-#   4. FastAPI RAG service on :8081
-#   5. Watch daemon (optional, if WATCH_ENABLED=true)
+#   4. llama-server (Auto-tagging LLM) on :8005
+#   5. FastAPI RAG service on :8081
+#   6. Watch daemon (optional, if WATCH_ENABLED=true)
 #
 # Usage: ./start.sh
 # ===========================================================================
@@ -45,6 +46,13 @@ CHAT_PORT="${CHAT_PORT:-8003}"
 CHAT_CTX_SIZE="${CHAT_CTX_SIZE:-32768}"
 CHAT_API_KEY="${CHAT_API_KEY:-sk-chat-layer3}"
 
+AUTOTAG_MODEL_PATH="${AUTOTAG_MODEL_PATH:-./models/Qwen3VL-8B-Instruct-F16.gguf}"
+AUTOTAG_MMPROJ_PATH="${AUTOTAG_MMPROJ_PATH:-./models/mmproj-Qwen3VL-8B-Instruct-F16.gguf}"
+AUTOTAG_PORT="${AUTOTAG_PORT:-8005}"
+AUTOTAG_CTX_SIZE="${AUTOTAG_CTX_SIZE:-4096}"
+AUTOTAG_API_KEY="${AUTOTAG_API_KEY:-sk-autotag-layer3b}"
+AUTOTAG_MODEL_NAME="${AUTOTAG_MODEL_NAME:-Qwen3VL-8B-Instruct-Autotag}"
+
 GPU_LAYERS="${GPU_LAYERS:-99}"
 API_HOST="${API_HOST:-0.0.0.0}"
 API_PORT="${API_PORT:-8081}"
@@ -79,8 +87,13 @@ if [ ! -f "$LLAMA_SERVER_PATH" ]; then
     echo "Run setup.sh first or update LLAMA_SERVER_PATH in .env"
     exit 1
 fi
+if [ ! -f "$AUTOTAG_MODEL_PATH" ]; then
+    echo -e "${RED}ERROR: autotag model not found at $AUTOTAG_MODEL_PATH${NC}"
+    echo "Run setup.sh first or update AUTOTAG_MODEL_PATH in .env"
+    exit 1
+fi
 
-TOTAL_STEPS=4
+TOTAL_STEPS=5
 if [ "$RERANKER_ENABLED" = "true" ]; then
     TOTAL_STEPS=$((TOTAL_STEPS + 1))
 fi
@@ -188,12 +201,34 @@ if [ "$RERANKER_ENABLED" = "true" ]; then
     export RERANKER_URL="http://127.0.0.1:${RERANKER_PORT}/v1/rerank"
 fi
 
-# --- 5. FastAPI ---
+# --- 5. Auto-tagging LLM ---
+STEP=$((STEP + 1))
+echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting Auto-tagging LLM on :${AUTOTAG_PORT}..."
+"$LLAMA_SERVER_PATH" \
+    -m "$AUTOTAG_MODEL_PATH" \
+    --host 0.0.0.0 \
+    --port "$AUTOTAG_PORT" \
+    -ngl "$GPU_LAYERS" \
+    --ctx-size "$AUTOTAG_CTX_SIZE" \
+    --flash-attn on \
+    --cache-type-k q8_0 \
+    --cache-type-v q8_0 \
+    -b 1024 \
+    --threads 10 \
+    --api-key "$AUTOTAG_API_KEY" \
+    > "$SCRIPT_DIR/logs/autotag.log" 2>&1 &
+echo $! >> "$PID_FILE"
+wait_for_server "Auto-tagging LLM" "$AUTOTAG_PORT" 120
+
+# --- 6. FastAPI ---
 STEP=$((STEP + 1))
 echo -e "${CYAN}[${STEP}/${TOTAL_STEPS}]${NC} Starting RAG service v4 on :${API_PORT}..."
 
 export EMBED_MODEL_URL="http://127.0.0.1:${EMBED_PORT}/v1/embeddings"
 export CHAT_MODEL_URL="http://127.0.0.1:${CHAT_PORT}/v1/chat/completions"
+export AUTOTAG_MODEL_URL="http://127.0.0.1:${AUTOTAG_PORT}/v1/chat/completions"
+export AUTOTAG_MODEL_NAME="$AUTOTAG_MODEL_NAME"
+export AUTOTAG_API_KEY="$AUTOTAG_API_KEY"
 
 uvicorn rag_service:app --host "$API_HOST" --port "$API_PORT" --log-level info &
 echo $! >> "$PID_FILE"
@@ -219,6 +254,7 @@ echo "  Health:      http://${API_HOST}:${API_PORT}/healthz"
 echo ""
 echo "  Embed Model: :${EMBED_PORT} (Qwen3-Embedding-8B)"
 echo "  Chat Model:  :${CHAT_PORT} (Qwen3.6-35B-A3B)"
+echo "  Autotag LLM: :${AUTOTAG_PORT} (${AUTOTAG_MODEL_NAME})"
 if [ "$RERANKER_ENABLED" = "true" ]; then
 echo "  Reranker:    :${RERANKER_PORT} (Qwen3-VL-Reranker-8B)"
 else

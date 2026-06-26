@@ -7,34 +7,28 @@ Used during ingestion (not in the chat hot path).
 
 import json
 import logging
+import re
 from typing import Dict, List
 
 import requests
 
 log = logging.getLogger("rag-pipeline")
 
+AUTOTAG_PROMPT_VERSION = "autotag-v2"
+AUTOTAG_SCHEMA = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-AUTOTAG_PROMPT = """Analyze this document and return ONLY a valid JSON object with these fields:
-{
-  "doc_type": "invoice|contract|report|letter|memo|receipt|policy|form|certificate|other",
-  "date": "YYYY-MM-DD or null if not found",
-  "parties": ["list of people or organizations mentioned"],
-  "tags": ["3-7 relevant topic keywords"],
-  "summary": "One concise sentence describing the document"
-}
+AUTOTAG_PROMPT = """Return ONLY compact JSON for this document.
+Fields: doc_type, date, parties, tags, summary.
+doc_type must be one of: invoice, contract, report, letter, memo, receipt, policy, form, certificate, other.
+Use null/[] when unknown. Lowercase doc_type and tags.
 
-Rules:
-- Return ONLY the JSON, no explanation
-- Use lowercase for doc_type and tags
-- If a field cannot be determined, use null or empty list
-
-Document:
----
-{text}
----"""
+Filename: {filename}
+Text:
+{text}"""
 
 FILTER_EXTRACT_PROMPT = """Given this user query, extract metadata filters to narrow document search.
 Return ONLY a valid JSON object. Only include fields you can confidently extract.
@@ -60,11 +54,15 @@ def _chat_completion(
     chat_model: str,
     chat_api_key: str,
     temperature: float = 0.7,
+    max_tokens: int = None,
 ) -> str:
     """Call the chat LLM and return content string."""
+    payload = {"model": chat_model, "messages": messages, "temperature": temperature}
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
     r = requests.post(
         chat_url,
-        json={"model": chat_model, "messages": messages, "temperature": temperature},
+        json=payload,
         headers={"Authorization": f"Bearer {chat_api_key}"},
         timeout=180,
     )
@@ -81,6 +79,52 @@ def _clean_json_response(raw: str) -> str:
     return cleaned.strip()
 
 
+def build_autotag_snippet(markdown_text: str, max_chars: int = 3000) -> str:
+    """Sample the start and end of long documents for faster metadata extraction."""
+    text = re.sub(r"[ \t]+", " ", markdown_text or "")
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+
+    head_chars = max(1, int(max_chars * 0.7))
+    tail_chars = max(1, max_chars - head_chars)
+    return (
+        text[:head_chars].rstrip()
+        + "\n\n[... middle omitted for faster metadata extraction ...]\n\n"
+        + text[-tail_chars:].lstrip()
+    )
+
+
+def normalize_autotag_result(result: dict) -> dict:
+    """Coerce model output into the public metadata schema."""
+    if not isinstance(result, dict):
+        result = {}
+
+    normalized = dict(AUTOTAG_SCHEMA)
+    normalized.update({k: result.get(k, v) for k, v in AUTOTAG_SCHEMA.items()})
+
+    doc_type = normalized.get("doc_type") or "other"
+    normalized["doc_type"] = str(doc_type).strip().lower() or "other"
+
+    date = normalized.get("date")
+    normalized["date"] = str(date).strip() if date else None
+
+    for field in ("parties", "tags"):
+        value = normalized.get(field)
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, list):
+            value = []
+        cleaned = [str(item).strip() for item in value if str(item).strip()]
+        if field == "tags":
+            cleaned = [item.lower() for item in cleaned]
+        normalized[field] = cleaned
+
+    summary = normalized.get("summary") or ""
+    normalized["summary"] = str(summary).strip()
+    return normalized
+
+
 # ---------------------------------------------------------------------------
 # Auto-Tagging
 # ---------------------------------------------------------------------------
@@ -89,29 +133,39 @@ def autotag_document(
     chat_url: str,
     chat_model: str,
     chat_api_key: str,
-    max_chars: int = 3000,
+    max_chars: int = 800,
+    filename: str = "",
 ) -> dict:
     """Use Chat LLM to auto-generate metadata tags from document text."""
-    snippet = (markdown_text or "")[:max_chars]
-    if not snippet.strip():
+    if not (markdown_text or "").strip():
         return {}
-    try:
-        prompt = AUTOTAG_PROMPT.replace("{text}", snippet)
+
+    def run_once(char_budget: int) -> dict:
+        snippet = build_autotag_snippet(markdown_text, char_budget)
+        if not snippet.strip():
+            return {}
+        prompt = AUTOTAG_PROMPT.replace("{filename}", filename or "unknown").replace("{text}", snippet)
         raw = _chat_completion(
             [{"role": "user", "content": prompt}],
             chat_url, chat_model, chat_api_key,
-            temperature=0.1,
+            temperature=0.0,
+            max_tokens=256,
         )
         result = json.loads(_clean_json_response(raw))
-        # Ensure expected fields exist
-        schema = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
-        for k, default in schema.items():
-            if k not in result:
-                result[k] = default
-        return result
+        return normalize_autotag_result(result)
+
+    try:
+        return run_once(max_chars)
     except Exception as e:
+        if "Context size has been exceeded" in str(e) and max_chars > 200:
+            try:
+                return run_once(max(200, max_chars // 2))
+            except Exception as retry_error:
+                e = retry_error
         log.warning(f"Auto-tag failed: {e}")
-        return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": "", "_error": str(e)}
+        fallback = dict(AUTOTAG_SCHEMA)
+        fallback["_error"] = str(e)
+        return fallback
 
 
 # ---------------------------------------------------------------------------

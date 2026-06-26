@@ -24,6 +24,7 @@ Endpoints:
 """
 
 import os, re, time, uuid, json, logging, hashlib, asyncio, threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -43,7 +44,12 @@ from modules.reranker import rerank_with_server, rerank_with_llm
 from modules.memory import (
     store_memory_async, search_memory, clear_session_memory, list_session_memory,
 )
-from modules.metadata import autotag_document, extract_filters_from_query
+from modules.metadata import (
+    AUTOTAG_PROMPT_VERSION,
+    autotag_document,
+    build_autotag_snippet,
+    extract_filters_from_query,
+)
 from modules.qdrant_ops import (
     get_client, ensure_collection, ensure_indexes,
     delete_document_chunks, search_hybrid, build_qdrant_filter, tokenize_bm25,
@@ -68,6 +74,10 @@ CHAT_MODEL_URL  = os.getenv("CHAT_MODEL_URL", "http://127.0.0.1:8003/v1/chat/com
 CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", "Qwen3.6-35B-A3B")
 CHAT_API_KEY    = os.getenv("CHAT_API_KEY", "sk-chat-layer3")
 
+AUTOTAG_MODEL_URL = os.getenv("AUTOTAG_MODEL_URL", CHAT_MODEL_URL)
+AUTOTAG_MODEL_NAME = os.getenv("AUTOTAG_MODEL_NAME", CHAT_MODEL_NAME)
+AUTOTAG_API_KEY = os.getenv("AUTOTAG_API_KEY", CHAT_API_KEY)
+
 QDRANT_URL        = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_COLLECTION = os.getenv("QDRANT_COLLECTION", "ocr_rag")
 MEMORY_COLLECTION = os.getenv("MEMORY_COLLECTION", "chat_memory")
@@ -78,7 +88,8 @@ RAG_TOP_K         = int(os.getenv("RAG_TOP_K", "15"))
 RAG_UPSERT_BATCH_SIZE = max(1, int(os.getenv("RAG_UPSERT_BATCH_SIZE", "64")))
 MEMORY_TOP_K      = int(os.getenv("MEMORY_TOP_K", "3"))
 MEMORY_ENABLED    = os.getenv("MEMORY_ENABLED", "true").lower() == "true"
-AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "3000"))
+AUTOTAG_MAX_CHARS = int(os.getenv("AUTOTAG_MAX_CHARS", "800"))
+AUTOTAG_CACHE_SIZE = max(0, int(os.getenv("AUTOTAG_CACHE_SIZE", "512")))
 MAX_CONTEXT_TOKENS = int(os.getenv("CHAT_CTX_SIZE", "32768")) - 6144
 
 # Reranker config (optional — if RERANKER_URL is set, use dedicated server)
@@ -89,6 +100,8 @@ RERANKER_API_KEY  = os.getenv("RERANKER_API_KEY", "sk-rerank-layer4")
 # Response cache (TTL-based)
 CACHE_TTL = int(os.getenv("CACHE_TTL", "300"))  # 5 minutes
 _response_cache: Dict[str, dict] = {}
+_autotag_cache: "OrderedDict[str, dict]" = OrderedDict()
+_autotag_cache_lock = threading.Lock()
 _embed_dim_cache: Optional[int] = None
 _chat_history_lock = threading.Lock()
 
@@ -119,7 +132,7 @@ app = FastAPI(title="RAG Pipeline API v3 — DGX Spark", version="3.0.0",
               description="Fast-by-default modular RAG. Re-ranking & agentic planning are opt-in.")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-log.info(f"Embed: {EMBED_MODEL_URL} | Chat: {CHAT_MODEL_URL} | Qdrant: {QDRANT_URL}")
+log.info(f"Embed: {EMBED_MODEL_URL} | Chat: {CHAT_MODEL_URL} | Autotag: {AUTOTAG_MODEL_URL} | Qdrant: {QDRANT_URL}")
 
 async def verify_api_key(x_api_key: str = Header(...)):
     if x_api_key not in API_KEY_DB:
@@ -237,6 +250,76 @@ def _cache_set(key: str, data: dict):
     _response_cache[key] = {"ts": time.time(), "data": data}
 
 
+def _autotag_cache_key(markdown_content: str, filename: str = "") -> str:
+    snippet = build_autotag_snippet(markdown_content or "", AUTOTAG_MAX_CHARS)
+    material = "\n".join([
+        AUTOTAG_PROMPT_VERSION,
+        AUTOTAG_MODEL_NAME,
+        filename or "",
+        snippet,
+    ])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _autotag_cache_get(key: str) -> Optional[dict]:
+    if AUTOTAG_CACHE_SIZE <= 0:
+        return None
+    with _autotag_cache_lock:
+        value = _autotag_cache.get(key)
+        if value is None:
+            return None
+        _autotag_cache.move_to_end(key)
+        return dict(value)
+
+
+def _autotag_cache_set(key: str, metadata: dict):
+    if AUTOTAG_CACHE_SIZE <= 0:
+        return
+    with _autotag_cache_lock:
+        _autotag_cache[key] = dict(metadata)
+        _autotag_cache.move_to_end(key)
+        while len(_autotag_cache) > AUTOTAG_CACHE_SIZE:
+            _autotag_cache.popitem(last=False)
+
+
+async def _autotag_async(markdown_content: str, filename: str = "") -> dict:
+    t0 = time.perf_counter()
+    key = _autotag_cache_key(markdown_content, filename)
+    sample_chars = len(build_autotag_snippet(markdown_content or "", AUTOTAG_MAX_CHARS))
+    cached = _autotag_cache_get(key)
+    if cached is not None:
+        log.info(f"Auto-tag cache HIT: {filename or key[:12]}")
+        return {
+            "metadata": cached,
+            "telemetry": {
+                "elapsed_seconds": round(time.perf_counter() - t0, 3),
+                "cache_hit": True,
+                "sample_chars": sample_chars,
+                "model": AUTOTAG_MODEL_NAME,
+            },
+        }
+
+    meta = await asyncio.to_thread(
+        autotag_document,
+        markdown_content,
+        AUTOTAG_MODEL_URL,
+        AUTOTAG_MODEL_NAME,
+        AUTOTAG_API_KEY,
+        AUTOTAG_MAX_CHARS,
+        filename,
+    )
+    _autotag_cache_set(key, meta)
+    return {
+        "metadata": meta,
+        "telemetry": {
+            "elapsed_seconds": round(time.perf_counter() - t0, 3),
+            "cache_hit": False,
+            "sample_chars": sample_chars,
+            "model": AUTOTAG_MODEL_NAME,
+        },
+    }
+
+
 def _hyde_expand(query: str) -> str:
     """HyDE: Generate a hypothetical answer to improve embedding quality for short queries."""
     if len(query.split()) > 12:
@@ -335,7 +418,8 @@ async def delete_session(name: str, api_key: str = Depends(verify_api_key)):
 async def health_check():
     health = {"status": "ok", "services": {}, "version": "3.0.0"}
     for name, port in [("embed_model", os.getenv("EMBED_PORT", "8002")),
-                       ("chat_model", os.getenv("CHAT_PORT", "8003"))]:
+                       ("chat_model", os.getenv("CHAT_PORT", "8003")),
+                       ("autotag_model", os.getenv("AUTOTAG_PORT", "8005"))]:
         try:
             r = requests.get(f"http://127.0.0.1:{port}/health", timeout=3)
             health["services"][name] = "up" if r.status_code == 200 else "degraded"
@@ -354,9 +438,43 @@ async def health_check():
 # Endpoints: Metadata
 # ===========================================================================
 @app.post("/v1/autotag", tags=["Metadata"])
-async def autotag_endpoint(api_key: str = Depends(verify_api_key), markdown_content: str = Body(..., embed=True)):
-    meta = autotag_document(markdown_content, CHAT_MODEL_URL, CHAT_MODEL_NAME, CHAT_API_KEY, AUTOTAG_MAX_CHARS)
-    return {"status": "ok", "metadata": meta}
+async def autotag_endpoint(
+    api_key: str = Depends(verify_api_key),
+    markdown_content: str = Body(..., embed=True),
+    filename: str = Body("", embed=True),
+):
+    result = await _autotag_async(markdown_content, filename)
+    return {"status": "ok", "metadata": result["metadata"], "telemetry": result["telemetry"]}
+
+
+@app.post("/v1/autotag/batch", tags=["Metadata"])
+async def autotag_batch_endpoint(
+    api_key: str = Depends(verify_api_key),
+    documents: List[dict] = Body(..., embed=True),
+    concurrency: int = Body(2, embed=True),
+):
+    t0 = time.perf_counter()
+    sem = asyncio.Semaphore(max(1, min(concurrency, 8)))
+
+    async def tag_one(doc: dict):
+        filename = doc.get("filename", "")
+        markdown_content = doc.get("markdown_content", "")
+        if not markdown_content:
+            return {"status": "error", "filename": filename, "error": "No markdown_content provided"}
+        try:
+            async with sem:
+                result = await _autotag_async(markdown_content, filename)
+            return {"status": "ok", "filename": filename, "metadata": result["metadata"], "telemetry": result["telemetry"]}
+        except Exception as e:
+            return {"status": "error", "filename": filename, "error": str(e)}
+
+    results = await asyncio.gather(*(tag_one(doc) for doc in documents))
+    return {
+        "status": "ok",
+        "documents": len(results),
+        "elapsed_seconds": round(time.perf_counter() - t0, 3),
+        "results": list(results),
+    }
 
 @app.get("/v1/metadata/{collection}/{filename}", tags=["Metadata"])
 async def get_metadata(collection: str, filename: str, api_key: str = Depends(verify_api_key)):
@@ -431,9 +549,22 @@ async def list_documents(collection: str, api_key: str = Depends(verify_api_key)
 # ===========================================================================
 def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size: int, metadata: dict, api_key: str) -> dict:
     """Core ingest logic. BM25 vectors include metadata for keyword searchability."""
+    ingest_started = time.perf_counter()
+    chunking_started = time.perf_counter()
     chunks = chunk_markdown_structural(markdown_content, chunk_size)
+    chunking_elapsed = round(time.perf_counter() - chunking_started, 3)
+    embedding_elapsed = 0.0
+    upsert_elapsed = 0.0
     if not chunks:
-        return {"status": "empty", "chunks": 0, "collection": collection, "filename": filename}
+        telemetry = {
+            "chunking_elapsed_seconds": chunking_elapsed,
+            "embedding_elapsed_seconds": 0.0,
+            "upsert_elapsed_seconds": 0.0,
+            "total_ingest_elapsed_seconds": round(time.perf_counter() - ingest_started, 3),
+            "chunks": 0,
+            "ingest_batches": 0,
+        }
+        return {"status": "empty", "chunks": 0, "ingest_batches": 0, "collection": collection, "filename": filename, "telemetry": telemetry}
     client = _qclient()
 
     # Build metadata text for BM25 enrichment
@@ -455,7 +586,9 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
         for batch_number, batch_start in enumerate(range(0, len(chunks), RAG_UPSERT_BATCH_SIZE), start=1):
             chunk_batch = chunks[batch_start:batch_start + RAG_UPSERT_BATCH_SIZE]
             texts = [chunk["text"] for chunk in chunk_batch]
+            embed_started = time.perf_counter()
             embeddings = _embed_batch(texts)
+            embedding_elapsed += time.perf_counter() - embed_started
             if len(texts) != len(embeddings):
                 raise RuntimeError(
                     f"Embedding count mismatch in batch {batch_number}/{total_batches}: "
@@ -486,7 +619,9 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
                 ))
 
             try:
+                upsert_started = time.perf_counter()
                 client.upsert(collection_name=collection, points=points)
+                upsert_elapsed += time.perf_counter() - upsert_started
                 write_started = True
             except Exception as exc:
                 raise RuntimeError(
@@ -524,8 +659,17 @@ def _do_ingest(filename: str, markdown_content: str, collection: str, chunk_size
         f"Ingested: {filename} | {len(chunks)} chunks | {total_batches} batches | "
         f"meta: {metadata.get('doc_type', 'none')} | bm25_enriched"
     )
+    telemetry = {
+        "chunking_elapsed_seconds": chunking_elapsed,
+        "embedding_elapsed_seconds": round(embedding_elapsed, 3),
+        "upsert_elapsed_seconds": round(upsert_elapsed, 3),
+        "total_ingest_elapsed_seconds": round(time.perf_counter() - ingest_started, 3),
+        "chunks": len(chunks),
+        "ingest_batches": total_batches,
+    }
     return {"status": "ok", "chunks": len(chunks), "ingest_batches": total_batches,
-            "collection": collection, "filename": filename, "sections": sections_summary, "metadata": metadata}
+            "collection": collection, "filename": filename, "sections": sections_summary, "metadata": metadata,
+            "telemetry": telemetry}
 
 
 def _attach_conversion_telemetry(result: dict, conversion) -> dict:

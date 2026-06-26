@@ -23,6 +23,7 @@ else
     # Only kill llama-servers on RAG ports (not OCR port 8001)
     fuser -k 8002/tcp 2>/dev/null || true
     fuser -k 8003/tcp 2>/dev/null || true
+    fuser -k 8005/tcp 2>/dev/null || true
     echo -e "${GREEN}Fallback cleanup done.${NC}"
 fi
 

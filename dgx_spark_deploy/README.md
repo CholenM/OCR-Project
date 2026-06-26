@@ -213,7 +213,7 @@ source .venv/bin/activate
 
 The Streamlit UI submits PDF/image uploads as asynchronous OCR jobs. This avoids browser request timeouts for large documents: the OCR service stores the upload and result on the DGX, while the UI polls job progress until the result is ready.
 
-Job files are retained for 24 hours by default under `OCR_JOB_DIR`. Configure `OCR_JOB_CONCURRENCY` to control the number of document jobs processed at once; keep the default of `1` for large PDFs to protect GPU memory.
+Job files are retained for 24 hours by default under `OCR_JOB_DIR`. Configure `OCR_JOB_CONCURRENCY` to control the number of document jobs processed at once; the default is `3` and the service clamps the value to 1-3.
 
 You should see:
 
@@ -384,6 +384,8 @@ Use OCR jobs for large PDFs. Submission returns immediately, allowing the client
 | `POST /v1/ocr/jobs` | Upload a PDF/image and receive a queued `job_id` |
 | `GET /v1/ocr/jobs/{job_id}` | Read job status, page progress, tokens, and failures |
 | `GET /v1/ocr/jobs/{job_id}/result` | Download Markdown once the job is complete |
+| `DELETE /v1/ocr/jobs/{job_id}` | Cancel one queued or running job |
+| `POST /v1/ocr/jobs/cancel` | Cancel multiple queued or running jobs with `{"job_ids": [...]}` |
 
 ```bash
 # Submit a large PDF
@@ -398,9 +400,15 @@ curl http://<dgx-spark-ip>:8080/v1/ocr/jobs/<job_id> \
 # Download result after status is completed
 curl http://<dgx-spark-ip>:8080/v1/ocr/jobs/<job_id>/result \
   -H "X-API-KEY: test_key_0000" -o handbook.md
+
+# Cancel one job
+curl -X DELETE http://<dgx-spark-ip>:8080/v1/ocr/jobs/<job_id> \
+  -H "X-API-KEY: test_key_0000"
 ```
 
-Jobs store source files, metadata, and Markdown results under `OCR_JOB_DIR`. Queued/running jobs are recovered after service restart when their source file remains available.
+Jobs store source files, metadata, and Markdown results under `OCR_JOB_DIR`. Queued/running jobs are recovered after service restart when their source file remains available, unless they were cancelled or `OCR_RECOVER_JOBS_ON_STARTUP=false`.
+
+Concurrency has two levels: `OCR_JOB_CONCURRENCY` controls how many documents run at once, while `max_concurrency`/`MAX_CONCURRENCY` controls how many pages run in parallel inside each document.
 
 ---
 
@@ -450,7 +458,8 @@ All configuration via `.env` file.
 | `API_HOST` | `0.0.0.0` | FastAPI bind address |
 | `MAX_CONCURRENCY` | `4` | Default max parallel pages |
 | `OCR_JOB_DIR` | `./ocr_jobs` | Disk location for queued uploads, job metadata, and Markdown results |
-| `OCR_JOB_CONCURRENCY` | `1` | Concurrent document jobs; keep at 1 for large PDFs |
+| `OCR_JOB_CONCURRENCY` | `3` | Concurrent document jobs, clamped to 1–3 |
+| `OCR_RECOVER_JOBS_ON_STARTUP` | `true` | Recover queued/running jobs after restart; set false to cancel old active jobs |
 | `OCR_JOB_RETENTION_HOURS` | `24` | Retention period for completed/failed job files |
 | `OCR_STATUS_POLL_SECONDS` | `2` | Streamlit UI polling interval |
 

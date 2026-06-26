@@ -81,6 +81,12 @@ def _init_state():
         "ocr_jobs": {},
         "ocr_job_failures": {},
         "ocr_metadata": {},
+        "autotag_status": {},
+        "autotag_errors": {},
+        "autotag_telemetry": {},
+        "autotag_started": False,
+        "processing_report": {},
+        "ingest_telemetry": {},
         "chat_messages": [],
         "active_session": None,
         "session_list": [],
@@ -102,6 +108,102 @@ def _init_state():
 
 
 _init_state()
+
+
+def _default_metadata():
+    return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+
+
+def _report_row(filename: str) -> dict:
+    return st.session_state.processing_report.setdefault(filename, {
+        "filename": filename,
+        "pages": 0,
+        "ocr_elapsed_seconds": 0.0,
+        "ocr_input_tokens": 0,
+        "ocr_output_tokens": 0,
+        "ocr_total_tokens": 0,
+        "ocr_tokens_per_sec": 0.0,
+        "ocr_tokens_per_page": 0.0,
+        "autotag_elapsed_seconds": 0.0,
+        "autotag_cache_hit": False,
+        "autotag_error": "",
+        "status": "pending",
+        "cancelled": False,
+        "cancel_reason": "",
+        "chunks": 0,
+        "chunking_elapsed_seconds": 0.0,
+        "embedding_elapsed_seconds": 0.0,
+        "upsert_elapsed_seconds": 0.0,
+        "ingest_elapsed_seconds": 0.0,
+        "total_elapsed_seconds": 0.0,
+    })
+
+
+def _recompute_total_elapsed(row: dict):
+    row["total_elapsed_seconds"] = round(
+        float(row.get("ocr_elapsed_seconds") or 0)
+        + float(row.get("autotag_elapsed_seconds") or 0)
+        + float(row.get("ingest_elapsed_seconds") or 0),
+        3,
+    )
+
+
+def _record_ocr_report(filename: str, job: dict):
+    row = _report_row(filename)
+    pages = int(job.get("pages_total") or job.get("pages_completed") or 0)
+    input_tokens = int(job.get("input_tokens", 0))
+    output_tokens = int(job.get("output_tokens", 0))
+    total_tokens = int(job.get("total_tokens", input_tokens + output_tokens))
+    elapsed = float(job.get("elapsed_seconds", 0) or 0)
+    row.update({
+        "status": job.get("status", row.get("status", "running")),
+        "cancelled": job.get("status") == "cancelled" or bool(job.get("cancel_requested")),
+        "cancel_reason": job.get("cancel_reason", row.get("cancel_reason", "")),
+        "pages": pages,
+        "ocr_elapsed_seconds": round(elapsed, 3),
+        "ocr_input_tokens": input_tokens,
+        "ocr_output_tokens": output_tokens,
+        "ocr_total_tokens": total_tokens,
+        "ocr_tokens_per_sec": round(float(job.get("tokens_per_sec") or (total_tokens / elapsed if elapsed > 0 else 0)), 3),
+        "ocr_tokens_per_page": round(total_tokens / pages, 3) if pages else 0.0,
+    })
+    _recompute_total_elapsed(row)
+
+
+def _record_cancelled_report(filename: str, job: dict, reason: str = ""):
+    row = _report_row(filename)
+    _record_ocr_report(filename, job)
+    row.update({
+        "status": "cancelled",
+        "cancelled": True,
+        "cancel_reason": reason or job.get("cancel_reason") or "Cancelled by user",
+    })
+    _recompute_total_elapsed(row)
+
+
+def _record_autotag_report(filename: str, telemetry: dict, error: str = ""):
+    row = _report_row(filename)
+    row.update({
+        "status": "tagged" if not error else "autotag_failed",
+        "autotag_elapsed_seconds": round(float((telemetry or {}).get("elapsed_seconds", 0) or 0), 3),
+        "autotag_cache_hit": bool((telemetry or {}).get("cache_hit", False)),
+        "autotag_error": error or "",
+    })
+    _recompute_total_elapsed(row)
+
+
+def _record_ingest_report(filename: str, response: dict):
+    row = _report_row(filename)
+    telemetry = response.get("telemetry", {}) or {}
+    row.update({
+        "status": "ingested",
+        "chunks": int(response.get("chunks", telemetry.get("chunks", 0)) or 0),
+        "chunking_elapsed_seconds": round(float(telemetry.get("chunking_elapsed_seconds", 0) or 0), 3),
+        "embedding_elapsed_seconds": round(float(telemetry.get("embedding_elapsed_seconds", 0) or 0), 3),
+        "upsert_elapsed_seconds": round(float(telemetry.get("upsert_elapsed_seconds", 0) or 0), 3),
+        "ingest_elapsed_seconds": round(float(telemetry.get("total_ingest_elapsed_seconds", 0) or 0), 3),
+    })
+    _recompute_total_elapsed(row)
 
 
 def _headers():
@@ -189,6 +291,56 @@ def _submit_ocr_job(name, data, ctype, endpoint, headers, params):
         return name, None, str(e)
 
 
+def _cancel_ocr_job(filename: str, job: dict):
+    job_id = job.get("job_id")
+    if not job_id:
+        return False, "Missing OCR job id."
+    try:
+        r = requests.delete(
+            f"{st.session_state.ocr_url}/v1/ocr/jobs/{job_id}",
+            headers=_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            updated = r.json()
+            job.update(updated)
+            job["status"] = updated.get("status", "cancelled")
+            _record_cancelled_report(filename, job, updated.get("cancel_reason", "Cancelled by user"))
+            return True, ""
+        return False, f"HTTP {r.status_code}: {r.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
+def _cancel_ocr_batch():
+    active = {
+        filename: job
+        for filename, job in st.session_state.ocr_jobs.items()
+        if job.get("status", "queued") in {"queued", "running"}
+    }
+    if not active:
+        return
+    job_ids = [job.get("job_id") for job in active.values() if job.get("job_id")]
+    try:
+        r = requests.post(
+            f"{st.session_state.ocr_url}/v1/ocr/jobs/cancel",
+            headers=_headers(),
+            json={"job_ids": job_ids},
+            timeout=15,
+        )
+        if r.status_code == 200:
+            by_id = {item.get("job_id"): item for item in r.json().get("cancelled", [])}
+            for filename, job in active.items():
+                updated = by_id.get(job.get("job_id"), {})
+                job.update(updated)
+                job["status"] = updated.get("status", "cancelled")
+                _record_cancelled_report(filename, job, updated.get("cancel_reason", "Cancelled by user"))
+        else:
+            st.error(f"Stop request failed: HTTP {r.status_code}: {r.text[:300]}")
+    except Exception as e:
+        st.error(f"Stop request failed: {e}")
+
+
 def _poll_ocr_jobs():
     """Refresh active OCR job state and fetch completed Markdown once."""
     jobs = st.session_state.ocr_jobs
@@ -212,6 +364,9 @@ def _poll_ocr_jobs():
 
             current = response.json()
             job.update(current)
+            if current.get("status") == "cancelled":
+                _record_cancelled_report(filename, job, current.get("cancel_reason", "Cancelled by user"))
+                continue
             if current.get("status") == "failed":
                 st.session_state.ocr_job_failures[filename] = current.get("error", "OCR job failed.")
                 continue
@@ -225,12 +380,7 @@ def _poll_ocr_jobs():
                 if result_response.status_code == 200:
                     markdown = result_response.text
                     st.session_state.ocr_results[filename] = markdown
-                    st.session_state.ocr_metadata[filename] = _autotag(
-                        filename,
-                        markdown,
-                        f"{st.session_state.rag_url}/v1/autotag",
-                        _headers(),
-                    )
+                    _record_ocr_report(filename, job)
                     job["result_fetched"] = True
                 else:
                     job["result_error"] = f"Result HTTP {result_response.status_code}: {result_response.text[:300]}"
@@ -245,7 +395,7 @@ def _ocr_jobs_are_terminal() -> bool:
     if not st.session_state.ocr_jobs:
         return False
     for job in st.session_state.ocr_jobs.values():
-        if job.get("status") == "failed":
+        if job.get("status") in {"failed", "cancelled"}:
             continue
         if job.get("status") == "completed" and job.get("result_fetched"):
             continue
@@ -262,14 +412,75 @@ def _finalize_ocr_jobs():
     st.session_state.uploader_key += 1
 
 
-def _autotag(name, markdown, endpoint, headers):
+def _autotag_batch(documents, endpoint, headers):
     try:
-        r = requests.post(endpoint, headers=headers, json={"markdown_content": markdown}, timeout=60)
+        r = requests.post(endpoint, headers=headers, json={"documents": documents, "concurrency": 2}, timeout=300)
         if r.status_code == 200:
-            return r.json().get("metadata", {})
-    except Exception:
-        pass
-    return {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+            return r.json()
+        return {"status": "error", "error": f"HTTP {r.status_code}: {r.text[:500]}"}
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _run_autotag_phase():
+    files = list(st.session_state.ocr_results.keys())
+    if not files:
+        return
+
+    st.subheader("Step 1b: Auto-Tagging Documents")
+    st.caption("OCR is complete. Metadata generation is now running separately.")
+
+    if not st.session_state.autotag_started:
+        st.session_state.autotag_started = True
+        for filename in files:
+            st.session_state.autotag_status[filename] = "pending"
+            st.session_state.ocr_metadata.setdefault(filename, _default_metadata())
+
+    done = sum(1 for filename in files if st.session_state.autotag_status.get(filename) in {"done", "failed"})
+    st.progress(done / len(files), text=f"{done} / {len(files)} documents")
+    for filename in files:
+        status = st.session_state.autotag_status.get(filename, "pending")
+        telemetry = st.session_state.autotag_telemetry.get(filename, {})
+        elapsed = telemetry.get("elapsed_seconds", 0)
+        cache = " | cache hit" if telemetry.get("cache_hit") else ""
+        st.markdown(f"**{filename}** - {status}")
+        if elapsed:
+            st.caption(f"Elapsed: {elapsed}s{cache}")
+        if st.session_state.autotag_errors.get(filename):
+            st.warning(f"{filename}: {st.session_state.autotag_errors[filename]}")
+
+    pending = [filename for filename in files if st.session_state.autotag_status.get(filename) not in {"done", "failed"}]
+    if not pending:
+        return
+
+    for filename in pending:
+        st.session_state.autotag_status[filename] = "running"
+
+    with st.status(f"Auto-tagging {len(pending)} document(s)...", expanded=True) as sb:
+        documents = [{"filename": filename, "markdown_content": st.session_state.ocr_results[filename]} for filename in pending]
+        response = _autotag_batch(documents, f"{st.session_state.rag_url}/v1/autotag/batch", _headers())
+        results = response.get("results", []) if response.get("status") == "ok" else []
+        by_name = {item.get("filename"): item for item in results}
+        for filename in pending:
+            item = by_name.get(filename)
+            if item and item.get("status") == "ok":
+                metadata = item.get("metadata") or _default_metadata()
+                telemetry = item.get("telemetry") or {}
+                error = metadata.get("_error", "")
+                st.session_state.ocr_metadata[filename] = metadata
+                st.session_state.autotag_telemetry[filename] = telemetry
+                st.session_state.autotag_errors[filename] = error
+                st.session_state.autotag_status[filename] = "failed" if error else "done"
+                _record_autotag_report(filename, telemetry, error)
+                st.write(f"`{filename}` tagged in {telemetry.get('elapsed_seconds', 0)}s")
+            else:
+                error = (item or {}).get("error") or response.get("error") or "Auto-tag failed"
+                st.session_state.ocr_metadata[filename] = _default_metadata()
+                st.session_state.autotag_errors[filename] = error
+                st.session_state.autotag_status[filename] = "failed"
+                _record_autotag_report(filename, {}, error)
+                st.write(f"`{filename}` failed: {error}")
+        sb.update(label="Auto-tagging complete", state="complete")
 
 
 def _is_direct_upload(filename: str) -> bool:
@@ -632,20 +843,39 @@ def render_ocr_dashboard():
 
     if st.session_state.ocr_jobs:
         _poll_ocr_jobs()
-        st.subheader("Step 1: OCR Jobs Running")
+        st.subheader("Step 1a: OCR Processing")
         st.caption("Large documents continue on the OCR server while this page polls for progress.")
+        active_jobs = [
+            job for job in st.session_state.ocr_jobs.values()
+            if job.get("status", "queued") in {"queued", "running"}
+        ]
+        if active_jobs and st.button("Stop OCR batch", type="secondary", use_container_width=True):
+            _cancel_ocr_batch()
+            st.rerun()
         for filename, job in st.session_state.ocr_jobs.items():
             status = job.get("status", "queued")
             total = int(job.get("pages_total", 0))
             completed = int(job.get("pages_completed", 0))
+            input_tokens = int(job.get("input_tokens", 0))
+            output_tokens = int(job.get("output_tokens", 0))
+            total_tokens = int(job.get("total_tokens", input_tokens + output_tokens))
+            elapsed = float(job.get("elapsed_seconds", 0) or 0)
+            tokens_per_sec = float(job.get("tokens_per_sec") or (total_tokens / elapsed if elapsed > 0 else 0))
+            tokens_per_page = total_tokens / total if total else 0
             st.markdown(f"**{filename}** - {status}")
+            if status in {"queued", "running"}:
+                if st.button("Stop", key=f"stop_ocr_{job.get('job_id', filename)}"):
+                    ok, err = _cancel_ocr_job(filename, job)
+                    if not ok:
+                        st.error(f"{filename}: {err}")
+                    st.rerun()
             if total:
                 st.progress(min(completed / total, 1.0), text=f"{completed} / {total} pages")
             else:
                 st.caption("Queued for OCR processing...")
             st.caption(
-                f"Elapsed: {job.get('elapsed_seconds', 0)}s | "
-                f"Tokens: {int(job.get('input_tokens', 0)) + int(job.get('output_tokens', 0)):,}"
+                f"Elapsed: {elapsed}s | Tokens: {total_tokens:,} | "
+                f"{tokens_per_sec:.2f} tok/s | {tokens_per_page:.1f} tok/page"
             )
             if job.get("page_failures"):
                 st.warning(f"{filename}: {len(job['page_failures'])} page(s) failed; successful pages will be retained.")
@@ -653,6 +883,14 @@ def render_ocr_dashboard():
                 st.error(f"{filename}: {job.get('error') or job.get('result_error') or job.get('poll_error')}")
 
         if _ocr_jobs_are_terminal():
+            _run_autotag_phase()
+            if any(st.session_state.autotag_status.get(filename) not in {"done", "failed"} for filename in st.session_state.ocr_results):
+                time.sleep(OCR_JOB_POLL_SECONDS)
+                st.rerun()
+            if not st.session_state.ocr_results and not st.session_state.pending_raw_documents:
+                st.session_state.ocr_jobs = {}
+                st.session_state.uploader_key += 1
+                st.rerun()
             _finalize_ocr_jobs()
             st.rerun()
 
@@ -696,6 +934,12 @@ def render_ocr_dashboard():
                 st.session_state.ocr_jobs = {}
                 st.session_state.ocr_job_failures = {}
                 st.session_state.ocr_metadata = {}
+                st.session_state.autotag_status = {}
+                st.session_state.autotag_errors = {}
+                st.session_state.autotag_telemetry = {}
+                st.session_state.autotag_started = False
+                st.session_state.processing_report = {}
+                st.session_state.ingest_telemetry = {}
                 params = {"dpi": dpi_value, "mode": mode_value}
                 if mode_value == "concurrent":
                     params["max_concurrency"] = 4
@@ -711,7 +955,8 @@ def render_ocr_dashboard():
                             "raw_content_b64": base64.b64encode(data).decode("utf-8"),
                             "size": len(data),
                         }
-                        st.session_state.ocr_metadata[f.name] = {"doc_type": "other", "date": None, "parties": [], "tags": [], "summary": ""}
+                        st.session_state.ocr_metadata[f.name] = _default_metadata()
+                        _report_row(f.name)
                         done += 1
                         prog.progress(done / len(uploaded_files), text=f"{done}/{len(uploaded_files)}")
                         st.write(f"`{f.name}` ready for RAG conversion")
@@ -780,6 +1025,12 @@ def render_ocr_dashboard():
             st.session_state.ocr_jobs = {}
             st.session_state.ocr_job_failures = {}
             st.session_state.ocr_metadata = {}
+            st.session_state.autotag_status = {}
+            st.session_state.autotag_errors = {}
+            st.session_state.autotag_telemetry = {}
+            st.session_state.autotag_started = False
+            st.session_state.processing_report = {}
+            st.session_state.ingest_telemetry = {}
             st.session_state.ocr_step = 1
             st.session_state.uploader_key += 1
             st.rerun()
@@ -864,7 +1115,18 @@ def render_ocr_dashboard():
                         try:
                             r = requests.post(f"{st.session_state.rag_url}/v1/ingest", headers=_headers(), json=payload, timeout=timeout)
                             if r.status_code == 200:
-                                total_chunks += r.json()["chunks"]
+                                data = r.json()
+                                total_chunks += data["chunks"]
+                                st.session_state.ingest_telemetry[fname] = data.get("telemetry", {})
+                                _record_ingest_report(fname, data)
+                                tel = data.get("telemetry", {})
+                                st.caption(
+                                    f"Chunks: {data.get('chunks', 0)} | "
+                                    f"chunking {tel.get('chunking_elapsed_seconds', 0)}s | "
+                                    f"embedding {tel.get('embedding_elapsed_seconds', 0)}s | "
+                                    f"upsert {tel.get('upsert_elapsed_seconds', 0)}s | "
+                                    f"total {tel.get('total_ingest_elapsed_seconds', 0)}s"
+                                )
                             else:
                                 errors.append(f"{fname}: HTTP {r.status_code} {r.text[:500]}")
                         except Exception as e:
@@ -878,6 +1140,53 @@ def render_ocr_dashboard():
                 else:
                     st.success(f"Ingested {total_chunks} chunks from {len(rnames)} file(s).")
                 refresh_sessions()
+
+    if st.session_state.processing_report:
+        st.markdown("---")
+        st.subheader("Step 4: Processing Report")
+        rows = list(st.session_state.processing_report.values())
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            total_files = len(df)
+            total_pages = int(df["pages"].sum()) if "pages" in df else 0
+            total_chunks = int(df["chunks"].sum()) if "chunks" in df else 0
+            total_ocr = round(float(df["ocr_elapsed_seconds"].sum()), 3) if "ocr_elapsed_seconds" in df else 0.0
+            total_autotag = round(float(df["autotag_elapsed_seconds"].sum()), 3) if "autotag_elapsed_seconds" in df else 0.0
+            total_ingest = round(float(df["ingest_elapsed_seconds"].sum()), 3) if "ingest_elapsed_seconds" in df else 0.0
+            avg_tps = round(float(df["ocr_tokens_per_sec"].mean()), 3) if total_files and "ocr_tokens_per_sec" in df else 0.0
+            avg_tokens_page = round(float(df["ocr_tokens_per_page"].mean()), 3) if total_files and "ocr_tokens_per_page" in df else 0.0
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Files", total_files)
+            c2.metric("Pages", total_pages)
+            c3.metric("Chunks", total_chunks)
+            c4.metric("OCR tok/s avg", f"{avg_tps:.2f}")
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("OCR elapsed", f"{total_ocr:.2f}s")
+            c6.metric("Autotag elapsed", f"{total_autotag:.2f}s")
+            c7.metric("Ingest elapsed", f"{total_ingest:.2f}s")
+            c8.metric("OCR tok/page avg", f"{avg_tokens_page:.1f}")
+
+            st.dataframe(df, use_container_width=True, hide_index=True)
+            csv_data = df.to_csv(index=False).encode("utf-8")
+            json_data = json.dumps(rows, indent=2, ensure_ascii=False).encode("utf-8")
+            dl1, dl2 = st.columns(2)
+            ts = int(time.time())
+            dl1.download_button(
+                "Download CSV report",
+                data=csv_data,
+                file_name=f"processing_report_{ts}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+            dl2.download_button(
+                "Download JSON report",
+                data=json_data,
+                file_name=f"processing_report_{ts}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
 
 
 def render_data_manager():
